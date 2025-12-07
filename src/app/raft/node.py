@@ -14,8 +14,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.raft.log import LogEntry, RaftLog
-from app.raft.state_machine import KeyValueStateMachine
+from src.app.raft.log import LogEntry, RaftLog
+from src.app.raft.state_machine import KeyValueStateMachine
 
 
 class RaftRole(Enum):
