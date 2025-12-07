@@ -1,0 +1,31 @@
+version: '3'
+services:
+  node1:
+    build: .
+    container_name: node1
+    command: --id node1 --peers node2,node3
+    ports:
+      - "8001:8000"
+    volumes:
+      - node1_data:/app/data
+  node2:
+    build: .
+    container_name: node2
+    command: --id node2 --peers node1,node3
+    ports:
+      - "8002:8000"
+    volumes:
+      - node2_data:/app/data
+  node3:
+    build: .
+    container_name: node3
+    command: --id node3 --peers node1,node2
+    ports:
+      - "8003:8000"
+    volumes:
+      - node3_data:/app/data
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
