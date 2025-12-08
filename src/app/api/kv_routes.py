@@ -5,7 +5,7 @@
 #   - GET    /kv/{key}
 #   - DELETE /kv/{key}
 #
-# PUT/DELETE отправляются только лидеру.
+# PUT/DELETE принимаются только лидером.
 # Лидер записывает команду в журнал и реплицирует её через AppendEntries.
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from src.app.raft.log import LogEntry
-from src.app.raft.models import AppendEntriesRequest
 from src.app.raft.node import RaftNode, RaftRole
 
 router = APIRouter(tags=["kv"])
@@ -34,9 +33,7 @@ def get_raft_node(request: Request) -> RaftNode:
 class PutRequest(BaseModel):
     """
     Тело запроса для PUT /kv/{key}.
-
-    Можно было бы принимать произвольный JSON,
-    но через модель проще документировать API.
+    Можно класть любой JSON в поле value.
     """
     value: Any
 
@@ -46,14 +43,14 @@ async def _replicate_command(request: Request, command: Dict[str, Any]) -> int:
     Репликация одной команды через RAFT.
     Вызывается только на лидере.
 
-    Алгоритм (упрощённый):
+    Алгоритм (упрощённо):
       1. Лидер добавляет запись в свой журнал.
       2. Шлёт AppendEntries с этой записью всем пирам.
       3. Считает успешные ответы.
       4. Если достигнуто большинство — увеличивает commitIndex
          и применяет запись к state machine.
 
-    Возвращает индекс записи в журнале.
+    Возвращает индекс записи в журнале (log_index).
     """
     node = get_raft_node(request)
 
@@ -84,21 +81,25 @@ async def _replicate_command(request: Request, command: Dict[str, Any]) -> int:
 
     async with httpx.AsyncClient(timeout=1.0) as client:
         for peer_id, base_url in peer_addresses.items():
-            req = AppendEntriesRequest(
-                term=term,
-                leader_id=node.node_id,
-                prev_log_index=prev_log_index,
-                prev_log_term=prev_log_term,
-                entries=[command],  # отправляем только новую команду
-                leader_commit=leader_commit,
-            )
+            payload = {
+                "term": term,
+                "leader_id": node.node_id,
+                "prev_log_index": prev_log_index,
+                "prev_log_term": prev_log_term,
+                "entries": [command],  # отправляем только одну новую команду
+                "leader_commit": leader_commit,
+            }
 
             try:
                 resp = await client.post(
                     f"{base_url}/raft/append_entries",
-                    json=req.model_dump(),
+                    json=payload,
                 )
-                resp.raise_for_status()
+
+                if resp.status_code != 200:
+                    # Узел недоступен или ошибка — RAFT это переживёт.
+                    continue
+
                 data = resp.json()
                 resp_term = int(data.get("term", term))
                 success = bool(data.get("success", False))
@@ -112,7 +113,7 @@ async def _replicate_command(request: Request, command: Dict[str, Any]) -> int:
                     successes += 1
 
             except Exception:
-                # Узел недоступен или ошибка сети — игнорируем, RAFT это выдерживает.
+                # Сеть/узел отвалился — игнорируем, продолжим с другими пирам.
                 continue
 
     # 3. Если получили большинство — считаем запись закоммиченной.
@@ -120,11 +121,8 @@ async def _replicate_command(request: Request, command: Dict[str, Any]) -> int:
         node.commit_index = new_index
         node.apply_committed_entries()
     else:
-        # В "настоящем" RAFT запись остаётся в логе и будет
-        # потихоньку доталкиваться до отставших узлов.
-        # Для учебного проекта этого поведения достаточно:
-        #   - мы не удаляем запись,
-        #   - commitIndex не двигаем, пока не будет большинства.
+        # В полном RAFT здесь должна быть логика "доталкивания" до отставших.
+        # Для курсача достаточно того, что запись остаётся в журнале лидера.
         pass
 
     return new_index
@@ -132,17 +130,16 @@ async def _replicate_command(request: Request, command: Dict[str, Any]) -> int:
 
 # ============ HANDLERS ============
 
-async def put_value(request: Request, key: str, body: PutRequest) -> dict:
+@router.put("/{key}")
+async def put_value(request: Request, key: str, body: PutRequest) -> Dict[str, Any]:
     """
-    Обработка PUT /kv/{key}.
-
-    Только лидер принимает запись и реплицирует её через RAFT.
-    Остальные узлы возвращают ошибку "not_leader".
+    PUT /kv/{key}
+    Принимается только лидером.
+    Остальные узлы возвращают 409 "not_leader" с подсказкой, куда идти.
     """
     node = get_raft_node(request)
 
     if node.role != RaftRole.LEADER:
-        # Узел не лидер — подсказываем, кого он считает лидером.
         detail: Dict[str, Any] = {
             "error": "not_leader",
             "node_id": node.node_id,
@@ -150,15 +147,9 @@ async def put_value(request: Request, key: str, body: PutRequest) -> dict:
             "leader_id": node.leader_id,
         }
 
-        # Попробуем найти адрес лидера, если знаем его id.
         peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
-        if node.leader_id == node.node_id:
-            # Теоретически не должно случаться
-            pass
-        elif node.leader_id is not None:
-            leader_addr = peer_addresses.get(node.leader_id)
-            if leader_addr:
-                detail["leader_address"] = leader_addr
+        if node.leader_id and node.leader_id in peer_addresses:
+            detail["leader_address"] = peer_addresses[node.leader_id]
 
         raise HTTPException(status_code=409, detail=detail)
 
@@ -167,23 +158,26 @@ async def put_value(request: Request, key: str, body: PutRequest) -> dict:
 
     return {
         "status": "ok",
+        "op": "put",
         "key": key,
         "value": body.value,
         "log_index": log_index,
         "term": node.current_term,
+        "node_id": node.node_id,
     }
 
 
-async def get_value(request: Request, key: str) -> dict:
+@router.get("/{key}")
+async def get_value(request: Request, key: str) -> Dict[str, Any]:
     """
-    Обработка GET /kv/{key}.
-
-    Для простоты читаем локальное состояние (state machine).
-    Это означает, что при обращении к отстающему узлу
-    могут быть слегка "старые" данные, но для учебного проекта это допустимо.
+    GET /kv/{key}
+    Читаем локальное состояние.
+    В теории возможно немного "старое" значение на отсталых узлах,
+    но для учебного проекта это допустимо.
     """
     node = get_raft_node(request)
     value = node.state_machine.get(key)
+
     if value is None:
         raise HTTPException(status_code=404, detail={"error": "key_not_found", "key": key})
 
@@ -196,10 +190,10 @@ async def get_value(request: Request, key: str) -> dict:
     }
 
 
-async def delete_value(request: Request, key: str) -> dict:
+@router.delete("/{key}")
+async def delete_value(request: Request, key: str) -> Dict[str, Any]:
     """
-    Обработка DELETE /kv/{key}.
-
+    DELETE /kv/{key}
     Аналогично PUT: только лидер принимает команду и реплицирует её.
     """
     node = get_raft_node(request)
@@ -214,6 +208,7 @@ async def delete_value(request: Request, key: str) -> dict:
         peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
         if node.leader_id and node.leader_id in peer_addresses:
             detail["leader_address"] = peer_addresses[node.leader_id]
+
         raise HTTPException(status_code=409, detail=detail)
 
     command = {"op": "delete", "key": key}
@@ -221,31 +216,9 @@ async def delete_value(request: Request, key: str) -> dict:
 
     return {
         "status": "ok",
+        "op": "delete",
         "key": key,
         "log_index": log_index,
         "term": node.current_term,
+        "node_id": node.node_id,
     }
-
-
-# ============ РЕГИСТРАЦИЯ МАРШРУТОВ ============
-
-router.add_api_route(
-    path="/{key}",
-    endpoint=put_value,
-    methods=["PUT"],
-    summary="Set value for key (through RAFT)",
-)
-
-router.add_api_route(
-    path="/{key}",
-    endpoint=get_value,
-    methods=["GET"],
-    summary="Get value for key",
-)
-
-router.add_api_route(
-    path="/{key}",
-    endpoint=delete_value,
-    methods=["DELETE"],
-    summary="Delete key (through RAFT)",
-)

@@ -1,31 +1,42 @@
-version: '3'
+version: "3.9"
+
 services:
   node1:
     build: .
-    container_name: node1
-    command: --id node1 --peers node2,node3
+    container_name: raft-node1
+    environment:
+      # ID узла
+      - NODE_ID=node1
+      # Список пиров: id:URL внутри docker-сети
+      - PEERS=node2:http://node2:8000,node3:http://node3:8000
     ports:
-      - "8001:8000"
-    volumes:
-      - node1_data:/app/data
+      # Пробрасываем наружу на хост
+      - "8000:8000"
+    networks:
+      - raft-net
+
   node2:
     build: .
-    container_name: node2
-    command: --id node2 --peers node1,node3
+    container_name: raft-node2
+    environment:
+      - NODE_ID=node2
+      - PEERS=node1:http://node1:8000,node3:http://node3:8000
     ports:
-      - "8002:8000"
-    volumes:
-      - node2_data:/app/data
+      - "8001:8000"
+    networks:
+      - raft-net
+
   node3:
     build: .
-    container_name: node3
-    command: --id node3 --peers node1,node2
+    container_name: raft-node3
+    environment:
+      - NODE_ID=node3
+      - PEERS=node1:http://node1:8000,node2:http://node2:8000
     ports:
-      - "8003:8000"
-    volumes:
-      - node3_data:/app/data
+      - "8002:8000"
+    networks:
+      - raft-net
 
-volumes:
-  node1_data:
-  node2_data:
-  node3_data:
+networks:
+  raft-net:
+    driver: bridge
