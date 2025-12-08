@@ -1,107 +1,104 @@
-# app/raft/log.py
+# src/app/raft/log.py
 #
-# Реализация журнала (лога) RAFT.
+# Журнал RAFT: список LogEntry.
+# Умеет:
+#   - хранить записи
+#   - отдавать last_index/last_term
+#   - обрезать хвост
+#   - доставать запись по индексу
 #
-# Важно:
-#   - Индексы в RAFT начинаются с 1.
-#   - Для удобства в self._entries[0] можно хранить "пустую" запись,
-#     чтобы индекс записи совпадал с индексом в списке.
+# Логические индексы начинаются с 1.
+# "Пустой" журнал имеет last_index = 0, last_term = 0.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
 class LogEntry:
-    """
-    Запись в RAFT-журнале.
-
-    term   - номер терма, в котором запись была создана лидером
-    index  - позиция записи в журнале (начинается с 1)
-    command - произвольная команда для state machine
-              в нашем случае это будет операция над KV-хранилищем,
-              но алгоритм RAFT не привязан к конкретному типу.
-    """
     term: int
     index: int
-    command: Any
+    command: Dict[str, Any]
 
 
+@dataclass
 class RaftLog:
-    """
-    Обёртка над списком LogEntry, инкапсулирует операции с журналом.
-    """
-
-    def __init__(self) -> None:
-        # Нулевая запись-заглушка, чтобы индексация начиналась с 1.
-        # Её можно считать "виртуальной" записью с term=0, index=0.
-        self._entries: List[LogEntry] = [LogEntry(term=0, index=0, command=None)]
+    entries: List[LogEntry] = field(default_factory=list)
 
     def last_index(self) -> int:
-        """Возвращает индекс последней записи в журнале."""
-        return self._entries[-1].index
+        if not self.entries:
+            return 0
+        return self.entries[-1].index
 
     def last_term(self) -> int:
-        """Возвращает term последней записи в журнале."""
-        return self._entries[-1].term
+        if not self.entries:
+            return 0
+        return self.entries[-1].term
 
     def get(self, index: int) -> Optional[LogEntry]:
         """
-        Возвращает запись по индексу или None, если такого индекса нет.
+        Возвращает запись с данным индексом или None, если её нет.
         """
-        if index < 0 or index > self.last_index():
+        if index <= 0:
             return None
-        return self._entries[index]
+        # индексы последовательные, можно обращаться по смещению
+        offset = index - 1
+        if 0 <= offset < len(self.entries):
+            return self.entries[offset]
+        return None
 
     def term_at(self, index: int) -> int:
         """
-        Возвращает term записи по индексу.
-        Если индекс 0 или меньше нуля — считаем, что term=0.
+        Возвращает term записи с данным индексом,
+        либо 0, если index == 0 или записи нет.
         """
-        if index <= 0:
+        if index == 0:
             return 0
         entry = self.get(index)
-        return entry.term if entry is not None else 0
+        if entry is None:
+            return 0
+        return entry.term
 
-    def append(self, entries: List[LogEntry]) -> None:
+    def append(self, new_entries: List[LogEntry]) -> None:
         """
-        Добавляет одну или несколько записей в конец журнала.
-
-        Предполагается, что:
-          - индекс каждой новой записи = last_index() + 1, last_index() + 2, ...
-        Это ответственность вызывающего кода (лидера при репликации).
+        Добавляет одну или несколько записей в конец.
         """
-        if not entries:
+        if not new_entries:
             return
-        self._entries.extend(entries)
+        self.entries.extend(new_entries)
 
     def truncate_from(self, index: int) -> None:
         """
-        Обрезает журнал, удаляя запись с index и всё, что после неё.
-        Используется при разрешении конфликтов AppendEntries.
+        Обрезает журнал, удаляя записи с индексом >= index.
         """
         if index <= 0:
-            # Полностью очищаем журнал до начальной записи-заглушки
-            self._entries = [self._entries[0]]
-        elif index <= self.last_index():
-            # сохраняем записи до index-1 включительно
-            self._entries = self._entries[: index]
+            self.entries.clear()
+            return
+        # оставляем все записи с индексом < index
+        self.entries = [e for e in self.entries if e.index < index]
 
-    def slice_from(self, index: int) -> List[LogEntry]:
+    # ==== Сериализация для персистентности ====
+
+    def to_serializable(self) -> List[Dict[str, Any]]:
         """
-        Возвращает срез записей, начиная с index (включительно) до конца.
-        Помогает лидеру отправлять "хвост" журнала.
+        Преобразует журнал в список dict-ов для сохранения в JSON.
         """
-        if index > self.last_index():
-            return []
-        return self._entries[index:]
+        return [
+            {"term": e.term, "index": e.index, "command": e.command}
+            for e in self.entries
+        ]
 
-    def __len__(self) -> int:
-        # Количество реальных записей без нулевой
-        return len(self._entries) - 1
-
-    def __iter__(self):
-        # Итерируем только по "реальным" записям (без нулевой).
-        return iter(self._entries[1:])
+    @classmethod
+    def from_serializable(cls, data: List[Dict[str, Any]]) -> "RaftLog":
+        entries: List[LogEntry] = []
+        for item in data:
+            entries.append(
+                LogEntry(
+                    term=int(item["term"]),
+                    index=int(item["index"]),
+                    command=item["command"],
+                )
+            )
+        return cls(entries=entries)

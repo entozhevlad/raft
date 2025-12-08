@@ -1,23 +1,12 @@
-# src/app/api/raft_routes.py
-#
-# HTTP-обёртки над RAFT RPC:
-#   - POST /raft/request_vote
-#   - POST /raft/append_entries
-#   - GET  /raft/status
-
 from __future__ import annotations
 
 import logging
+from typing import Any, Dict
 
 from fastapi import APIRouter, Request
 
-from src.app.raft.models import (
-    RequestVoteRequest,
-    RequestVoteResponse,
-    AppendEntriesRequest,
-    AppendEntriesResponse,
-)
 from src.app.raft.node import RaftNode
+from src.app.raft.persistence import save_full_state
 
 router = APIRouter(tags=["raft"])
 logger = logging.getLogger("raft")
@@ -28,77 +17,83 @@ def get_raft_node(request: Request) -> RaftNode:
     return raft_node
 
 
-async def request_vote(
-    request: Request,
-    body: RequestVoteRequest,
-) -> RequestVoteResponse:
-    """
-    Обработчик RPC RequestVote.
-    ВАЖНО: никогда не кидает исключения наружу, всегда возвращает 200.
-    """
+@router.post("/request_vote")
+async def request_vote(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
     node = get_raft_node(request)
 
     try:
+        term = int(body.get("term", 0))
+        candidate_id = str(body.get("candidate_id"))
+        last_log_index = int(body.get("last_log_index", 0))
+        last_log_term = int(body.get("last_log_term", 0))
+
         logger.info(
             "[%s] HTTP /raft/request_vote: term=%s cand=%s last_idx=%s last_term=%s",
             node.node_id,
-            body.term,
-            body.candidate_id,
-            body.last_log_index,
-            body.last_log_term,
+            term,
+            candidate_id,
+            last_log_index,
+            last_log_term,
         )
 
-        term, vote_granted = node.handle_request_vote(
-            term=body.term,
-            candidate_id=body.candidate_id,
-            candidate_last_log_index=body.last_log_index,
-            candidate_last_log_term=body.last_log_term,
+        resp_term, vote_granted = node.handle_request_vote(
+            term=term,
+            candidate_id=candidate_id,
+            candidate_last_log_index=last_log_index,
+            candidate_last_log_term=last_log_term,
         )
 
-        return RequestVoteResponse(term=term, vote_granted=vote_granted)
+        # metadata могла измениться (current_term, voted_for) — сохраним
+        node_data_dir: str = request.app.state.data_dir  # type: ignore[assignment]
+        save_full_state(node, node_data_dir)
+
+        return {"term": resp_term, "vote_granted": vote_granted}
 
     except Exception as exc:
-        # На всякий пожарный: если что-то пошло не так,
-        # не роняем приложение и не даём 503.
         logger.exception(
             "[%s] ERROR in /raft/request_vote handler: %r",
             node.node_id,
             exc,
         )
-        return RequestVoteResponse(term=node.current_term, vote_granted=False)
+        return {"term": node.current_term, "vote_granted": False}
 
 
-async def append_entries(
-    request: Request,
-    body: AppendEntriesRequest,
-) -> AppendEntriesResponse:
-    """
-    Обработчик RPC AppendEntries (heartbeat + репликация).
-    Также гарантированно возвращает 200.
-    """
+@router.post("/append_entries")
+async def append_entries(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
     node = get_raft_node(request)
 
     try:
+        term = int(body.get("term", 0))
+        leader_id = str(body.get("leader_id"))
+        prev_log_index = int(body.get("prev_log_index", 0))
+        prev_log_term = int(body.get("prev_log_term", 0))
+        entries = body.get("entries") or []
+        leader_commit = int(body.get("leader_commit", 0))
+
         logger.info(
             "[%s] HTTP /raft/append_entries: from leader=%s term=%s entries=%d",
             node.node_id,
-            body.leader_id,
-            body.term,
-            len(body.entries),
+            leader_id,
+            term,
+            len(entries),
         )
 
-        term, success = node.handle_append_entries(
-            term=body.term,
-            leader_id=body.leader_id,
-            prev_log_index=body.prev_log_index,
-            prev_log_term=body.prev_log_term,
-            entries=body.entries,
-            leader_commit=body.leader_commit,
+        resp_term, success = node.handle_append_entries(
+            term=term,
+            leader_id=leader_id,
+            prev_log_index=prev_log_index,
+            prev_log_term=prev_log_term,
+            entries=entries,
+            leader_commit=leader_commit,
         )
 
         node.apply_committed_entries()
 
-        return AppendEntriesResponse(term=term, success=success)
+        # Журнал и KV могли измениться — сохраняем
+        node_data_dir: str = request.app.state.data_dir  # type: ignore[assignment]
+        save_full_state(node, node_data_dir)
+
+        return {"term": resp_term, "success": success}
 
     except Exception as exc:
         logger.exception(
@@ -106,10 +101,11 @@ async def append_entries(
             node.node_id,
             exc,
         )
-        return AppendEntriesResponse(term=node.current_term, success=False)
+        return {"term": node.current_term, "success": False}
 
 
-async def raft_status(request: Request) -> dict:
+@router.get("/status")
+async def raft_status(request: Request) -> Dict[str, Any]:
     node = get_raft_node(request)
     return {
         "node_id": node.node_id,
@@ -121,27 +117,3 @@ async def raft_status(request: Request) -> dict:
         "last_log_index": node.log.last_index(),
         "last_log_term": node.log.last_term(),
     }
-
-
-router.add_api_route(
-    path="/request_vote",
-    endpoint=request_vote,
-    methods=["POST"],
-    summary="RAFT RequestVote RPC",
-    response_model=RequestVoteResponse,
-)
-
-router.add_api_route(
-    path="/append_entries",
-    endpoint=append_entries,
-    methods=["POST"],
-    summary="RAFT AppendEntries RPC",
-    response_model=AppendEntriesResponse,
-)
-
-router.add_api_route(
-    path="/status",
-    endpoint=raft_status,
-    methods=["GET"],
-    summary="RAFT node status",
-)

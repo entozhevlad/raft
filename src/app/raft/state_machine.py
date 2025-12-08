@@ -1,7 +1,9 @@
-# app/raft/state_machine.py
+# src/app/raft/state_machine.py
 #
-# Простейшая KV-машина состояний, поверх которой работает RAFT.
-# Именно сюда применяются закоммиченные команды из журнала.
+# Простая KV state machine поверх журнала RAFT.
+# Команды:
+#   {"op": "put", "key": str, "value": Any}
+#   {"op": "delete", "key": str}
 
 from __future__ import annotations
 
@@ -11,54 +13,37 @@ from typing import Any, Dict, Optional
 
 @dataclass
 class KeyValueStateMachine:
-    """
-    Простое KV-хранилище.
-    В реальной жизни здесь могла бы быть отдельная база данных,
-    но для учебного проекта достаточно словаря в памяти.
-    """
-    _storage: Dict[str, Any] = field(default_factory=dict)
+    store: Dict[str, Any] = field(default_factory=dict)
 
-    def apply(self, command: Dict[str, Any]) -> Optional[Any]:
+    def apply(self, command: Dict[str, Any]) -> None:
         """
-        Применяет команду к хранилищу.
-
-        Ожидаемый формат команды:
-          - {"op": "put", "key": str, "value": Any}
-          - {"op": "delete", "key": str}
-        Возвращает:
-          - при put: записанное значение
-          - при delete: удалённое значение или None, если ключа не было
+        Применяет одну команду к локальному KV-словарю.
         """
         op = command.get("op")
         key = command.get("key")
 
         if op == "put":
-            value = command.get("value")
-            self._storage[key] = value
-            return value
-
-        if op == "delete":
-            return self._storage.pop(key, None)
-
-        # На случай неизвестной операции — просто игнорируем.
-        # В реальном коде лучше логировать такие ситуации.
-        return None
+            self.store[str(key)] = command.get("value")
+        elif op == "delete":
+            if key in self.store:
+                del self.store[key]
+        else:
+            # неизвестная команда — для простоты игнорируем
+            pass
 
     def get(self, key: str) -> Optional[Any]:
-        """Возвращает значение по ключу или None, если нет."""
-        return self._storage.get(key)
+        return self.store.get(key)
 
-    def snapshot(self) -> Dict[str, Any]:
-        """
-        Возвращает "снимок" текущего состояния.
-        Для простоты — просто копия словаря.
-        Потом мы будем сохранять это на диск.
-        """
-        return dict(self._storage)
+    # ==== Для персистентности ====
 
-    def load_snapshot(self, data: Dict[str, Any]) -> None:
+    def export_state(self) -> Dict[str, Any]:
         """
-        Загружает состояние из снапшота.
-        Используется при рестарте узла или установке снапшота лидером.
+        Возвращает текущее состояние KV для сохранения в JSON.
         """
-        self._storage = dict(data)
+        return dict(self.store)
+
+    def load_state(self, data: Dict[str, Any]) -> None:
+        """
+        Загружает состояние KV из словаря (после чтения JSON).
+        """
+        self.store = dict(data)

@@ -1,19 +1,17 @@
-version: "3.9"
-
 services:
   node1:
     build: .
     container_name: raft-node1
     environment:
-      # ID узла
       - NODE_ID=node1
-      # Список пиров: id:URL внутри docker-сети
       - PEERS=node2:http://node2:8000,node3:http://node3:8000
+      - DATA_DIR=/data
     ports:
-      # Пробрасываем наружу на хост
       - "8000:8000"
     networks:
       - raft-net
+    volumes:
+      - ./data/node1:/data
 
   node2:
     build: .
@@ -21,10 +19,13 @@ services:
     environment:
       - NODE_ID=node2
       - PEERS=node1:http://node1:8000,node3:http://node3:8000
+      - DATA_DIR=/data
     ports:
       - "8001:8000"
     networks:
       - raft-net
+    volumes:
+      - ./data/node2:/data
 
   node3:
     build: .
@@ -32,10 +33,13 @@ services:
     environment:
       - NODE_ID=node3
       - PEERS=node1:http://node1:8000,node2:http://node2:8000
+      - DATA_DIR=/data
     ports:
       - "8002:8000"
     networks:
       - raft-net
+    volumes:
+      - ./data/node3:/data
 
 networks:
   raft-net:

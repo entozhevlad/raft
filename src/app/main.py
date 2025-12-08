@@ -1,3 +1,14 @@
+# src/app/main.py
+#
+# Точка входа FastAPI-приложения.
+# Здесь мы:
+#   - настраиваем логирование
+#   - создаём FastAPI-приложение
+#   - инициализируем RaftNode
+#   - загружаем его состояние с диска (если есть)
+#   - настраиваем фоновые задачи RAFT (выборы, heartbeat)
+#   - подключаем роуты (health + raft + kv)
+
 from fastapi import FastAPI
 
 from src.app.api.healthz import router as health_router
@@ -6,6 +17,7 @@ from src.app.api.kv_routes import router as kv_router
 from src.app.config import load_node_config
 from src.app.raft.node import RaftNode
 from src.app.raft.timers import setup_raft_background_tasks
+from src.app.raft.persistence import ensure_node_data_dir, load_node_state
 from src.app.utils.logging import setup_logging
 
 
@@ -25,9 +37,16 @@ def create_app() -> FastAPI:
     # === Инициализация RAFT-узла ===
     raft_node = RaftNode(node_id=config.node_id, peers=config.peers)
 
-    # Кладём узел и адреса пиров в state приложения.
+    # Каталог для состояния этого узла
+    node_data_dir = ensure_node_data_dir(config.data_dir, config.node_id)
+
+    # Загружаем состояние, если уже было (после предыдущего запуска)
+    load_node_state(raft_node, node_data_dir)
+
+    # Кладём узел и настройки в state приложения.
     app.state.raft_node = raft_node
     app.state.peer_addresses = config.peer_addresses
+    app.state.data_dir = node_data_dir
 
     # === Фоновые задачи RAFT (выборы + heartbeat) ===
     setup_raft_background_tasks(app)
