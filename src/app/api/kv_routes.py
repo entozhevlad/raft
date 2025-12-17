@@ -45,8 +45,8 @@ async def _replicate_command(request: Request, command: Dict[str, Any]) -> int:
     if node.role != RaftRole.LEADER:
         raise RuntimeError("replicate_command called on non-leader")
 
-    peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
-    node_data_dir: str = request.app.state.data_dir  # type: ignore[assignment]
+    peer_addresses: Dict[str, str] = request.app.state.peer_addresses
+    node_data_dir: str = request.app.state.data_dir
 
     # 1. Добавляем запись в локальный журнал.
     new_index = node.log.last_index() + 1
@@ -168,7 +168,7 @@ async def delete_value(request: Request, key: str) -> Dict[str, Any]:
             "role": node.role.name,
             "leader_id": node.leader_id,
         }
-        peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
+        peer_addresses: Dict[str, str] = request.app.state.peer_addresses
         if node.leader_id and node.leader_id in peer_addresses:
             detail["leader_address"] = peer_addresses[node.leader_id]
 

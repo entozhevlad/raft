@@ -44,7 +44,7 @@ async def request_vote(request: Request, body: Dict[str, Any]) -> Dict[str, Any]
         )
 
         # metadata могла измениться (current_term, voted_for) — сохраним
-        node_data_dir: str = request.app.state.data_dir  # type: ignore[assignment]
+        node_data_dir: str = request.app.state.data_dir
         save_full_state(node, node_data_dir)
 
         return {"term": resp_term, "vote_granted": vote_granted}
@@ -90,7 +90,7 @@ async def append_entries(request: Request, body: Dict[str, Any]) -> Dict[str, An
         node.apply_committed_entries()
 
         # Журнал и KV могли измениться — сохраняем
-        node_data_dir: str = request.app.state.data_dir  # type: ignore[assignment]
+        node_data_dir: str = request.app.state.data_dir
         save_full_state(node, node_data_dir)
 
         return {"term": resp_term, "success": success}

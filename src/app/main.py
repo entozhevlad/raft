@@ -28,7 +28,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Raft KV Store",
         version="0.1.0",
-        description="Учебное распределённое key-value хранилище на основе RAFT",
+        description="Распределённое key-value хранилище на основе RAFT",
     )
 
     # === Конфигурация узла ===
