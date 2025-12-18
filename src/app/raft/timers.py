@@ -15,7 +15,9 @@ from typing import Dict
 import httpx
 from fastapi import FastAPI
 
-from src.app.raft.models import RequestVoteRequest, AppendEntriesRequest
+from src.app.raft.persistence import save_metadata, save_full_state
+from src.app.raft.replication import replicate_to_peer, advance_commit_index
+from src.app.raft.models import RequestVoteRequest
 from src.app.raft.node import RaftNode, RaftRole
 
 logger = logging.getLogger("raft")
@@ -57,6 +59,7 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
       - если за это время не было heartbeat и мы не лидер — начинаем выборы
     """
     peer_addresses: Dict[str, str] = app.state.peer_addresses  # type: ignore[assignment]
+    node_data_dir: str = app.state.data_dir  # type: ignore[assignment]
 
     while True:
         timeout = random.uniform(*ELECTION_TIMEOUT_RANGE)
@@ -72,6 +75,8 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
 
         # Старт выборов
         node.become_candidate()
+        save_metadata(node, node_data_dir)
+
         current_term = node.current_term
         last_index, last_term = node.last_log_index_term()
 
@@ -117,7 +122,6 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
                     )
 
                     if resp.status_code != 200:
-                        # 503 и прочее — голос не засчитываем
                         continue
 
                     data = resp.json()
@@ -126,6 +130,7 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
 
                     if resp_term > node.current_term:
                         node.become_follower(resp_term)
+                        save_metadata(node, node_data_dir)
                         break
 
                     if vote_granted:
@@ -150,8 +155,6 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
                     )
                     continue
 
-        # Если цикл закончился, а мы всё ещё кандидат в том же term —
-        # проверяем, набрали ли большинство (важно для кластера из 1 ноды).
         if (
             node.role == RaftRole.CANDIDATE
             and node.current_term == current_term
@@ -162,10 +165,17 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
 
 async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
     """
-    Цикл heartbeat'ов лидера:
-      - если мы лидер, периодически шлём AppendEntries с пустыми entries
+    Цикл heartbeat'ов/репликации лидера:
+      - если мы лидер, периодически:
+          1) догоняюще реплицируем лог на всех peers (это же и heartbeat)
+          2) пытаемся продвинуть commitIndex
+          3) применяем закоммиченное к state machine
+
+    Важно: тут heartbeat НЕ шлётся \"всем одинаковый prev_log_index\".
+    Вместо этого используем nextIndex/matchIndex для каждого peer.
     """
     peer_addresses: Dict[str, str] = app.state.peer_addresses  # type: ignore[assignment]
+    node_data_dir: str = app.state.data_dir  # type: ignore[assignment]
 
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -173,56 +183,48 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
         if node.role != RaftRole.LEADER:
             continue
 
-        current_term = node.current_term
-        leader_commit = node.commit_index
-        last_index, last_term = node.last_log_index_term()
+        cluster_size = 1 + len(peer_addresses)
 
         async with httpx.AsyncClient(timeout=1.0) as client:
+            leader_commit = node.commit_index
+
+            # 1) Репликация/heartbeat на peers
             for peer_id, base_url in peer_addresses.items():
-                req = AppendEntriesRequest(
-                    term=current_term,
-                    leader_id=node.node_id,
-                    prev_log_index=last_index,
-                    prev_log_term=last_term,
-                    entries=[],
+                ok = await replicate_to_peer(
+                    client=client,
+                    node=node,
+                    peer_id=peer_id,
+                    base_url=base_url,
                     leader_commit=leader_commit,
                 )
 
-                try:
-                    logger.info(
-                        "[%s] -> Heartbeat to %s at %s (term=%s, commit=%s)",
-                        node.node_id,
-                        peer_id,
-                        base_url,
-                        current_term,
-                        leader_commit,
-                    )
-                    resp = await client.post(
-                        f"{base_url}/raft/append_entries",
-                        json=req.model_dump(),
-                    )
-                    logger.info(
-                        "[%s] <- heartbeat resp from %s: %s",
-                        node.node_id,
-                        peer_id,
-                        resp.status_code,
-                    )
+                # replicate_to_peer мог перевести нас в follower, если увидел более новый term
+                if node.role != RaftRole.LEADER:
+                    save_metadata(node, node_data_dir)
+                    break
 
-                    if resp.status_code != 200:
-                        continue
+                logger.debug(
+                    "[%s] heartbeat/replicate peer=%s ok=%s nextIndex=%s matchIndex=%s",
+                    node.node_id,
+                    peer_id,
+                    ok,
+                    node.next_index.get(peer_id),
+                    node.match_index.get(peer_id),
+                )
 
-                    data = resp.json()
-                    resp_term = int(data.get("term", current_term))
+            if node.role != RaftRole.LEADER:
+                continue
 
-                    if resp_term > node.current_term:
-                        node.become_follower(resp_term)
-                        break
+            # 2) Пробуем продвинуть commitIndex по majority
+            advanced = advance_commit_index(node, cluster_size=cluster_size)
+            if advanced is not None:
+                logger.info(
+                    "[%s] leader advanced commit_index -> %s",
+                    node.node_id,
+                    node.commit_index,
+                )
+                node.apply_committed_entries()
+                save_full_state(node, node_data_dir)
 
-                except Exception as exc:
-                    logger.warning(
-                        "[%s] Heartbeat to %s failed: %r",
-                        node.node_id,
-                        peer_id,
-                        exc,
-                    )
-                    continue
+            # 3) Сохраняем metadata (для учебного проекта нормально)
+            save_metadata(node, node_data_dir)

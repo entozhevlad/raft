@@ -6,11 +6,13 @@
 #   - DELETE /kv/{key}
 #
 # PUT/DELETE принимаются только лидером.
-# Лидер записывает команду в журнал, реплицирует её и при коммите
-# сохраняет состояние на диск.
+# Лидер записывает команду в журнал, реплицирует её (с догоняющей репликацией)
+# и коммитит только когда запись подтверждена большинством.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any, Dict
 
 import httpx
@@ -19,7 +21,8 @@ from pydantic import BaseModel
 
 from src.app.raft.log import LogEntry
 from src.app.raft.node import RaftNode, RaftRole
-from src.app.raft.persistence import save_full_state
+from src.app.raft.persistence import save_full_state, save_metadata
+from src.app.raft.replication import advance_commit_index, replicate_to_peer
 
 router = APIRouter(tags=["kv"])
 
@@ -33,10 +36,20 @@ class PutRequest(BaseModel):
     value: Any
 
 
-async def _replicate_command(request: Request, command: Dict[str, Any]) -> int:
-    """
-    Репликация одной команды через RAFT.
-    Вызывается только на лидере.
+async def _replicate_command(
+    request: Request,
+    command: Dict[str, Any],
+    *,
+    commit_timeout_s: float = 3.0,
+) -> int:
+    """Репликация одной команды через RAFT (только на лидере).
+
+    Алгоритм:
+      1) append в локальный лог
+      2) fsync-подобно: сохраняем метаданные/лог на диск до коммита (минимально)
+      3) догоняющая репликация на peers через nextIndex/matchIndex
+      4) двигаем commitIndex по правилу RAFT
+      5) apply + save_full_state() после коммита
 
     Возвращает индекс записи в журнале.
     """
@@ -48,65 +61,68 @@ async def _replicate_command(request: Request, command: Dict[str, Any]) -> int:
     peer_addresses: Dict[str, str] = request.app.state.peer_addresses
     node_data_dir: str = request.app.state.data_dir
 
-    # 1. Добавляем запись в локальный журнал.
+    # 1) Append локально
     new_index = node.log.last_index() + 1
-    entry = LogEntry(
-        term=node.current_term,
-        index=new_index,
-        command=command,
-    )
+    entry = LogEntry(term=node.current_term, index=new_index, command=command)
     node.log.append([entry])
 
-    term = node.current_term
-    prev_log_index = new_index - 1
-    prev_log_term = node.log.term_at(prev_log_index)
-    leader_commit = node.commit_index
+    # Важно: term/voted_for и лог должны пережить рестарт (упрощенно — сохраняем целиком).
+    save_metadata(node, node_data_dir)
+    save_full_state(node, node_data_dir)
 
-    successes = 1  # сам лидер
-    total_nodes = 1 + len(peer_addresses)
-    majority = total_nodes // 2 + 1
+    cluster_size = 1 + len(peer_addresses)
+
+    deadline = time.monotonic() + commit_timeout_s
 
     async with httpx.AsyncClient(timeout=1.0) as client:
-        for peer_id, base_url in peer_addresses.items():
-            payload = {
-                "term": term,
-                "leader_id": node.node_id,
-                "prev_log_index": prev_log_index,
-                "prev_log_term": prev_log_term,
-                "entries": [command],
-                "leader_commit": leader_commit,
-            }
-
-            try:
-                resp = await client.post(
-                    f"{base_url}/raft/append_entries",
-                    json=payload,
+        while time.monotonic() < deadline:
+            # Если лидерство потеряно — прекращаем.
+            if node.role != RaftRole.LEADER:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "not_leader",
+                        "node_id": node.node_id,
+                        "role": node.role.name,
+                        "leader_id": node.leader_id,
+                    },
                 )
 
-                if resp.status_code != 200:
-                    continue
+            leader_commit = node.commit_index
 
-                data = resp.json()
-                resp_term = int(data.get("term", term))
-                success = bool(data.get("success", False))
+            # 2) Догоняющая репликация на всех peers.
+            for peer_id, base_url in peer_addresses.items():
+                await replicate_to_peer(
+                    client=client,
+                    node=node,
+                    peer_id=peer_id,
+                    base_url=base_url,
+                    leader_commit=leader_commit,
+                )
 
-                if resp_term > node.current_term:
-                    node.become_follower(resp_term)
-                    break
+            # 3) Пробуем продвинуть commit_index.
+            advanced = advance_commit_index(node, cluster_size=cluster_size)
+            if advanced is not None:
+                node.apply_committed_entries()
+                save_full_state(node, node_data_dir)
 
-                if success:
-                    successes += 1
+            # 4) Если наша запись закоммичена — успех.
+            if node.commit_index >= new_index:
+                return new_index
 
-            except Exception:
-                continue
+            await asyncio.sleep(0.05)
 
-    # 3. Если получили большинство — коммитим и сохраняем на диск.
-    if successes >= majority:
-        node.commit_index = new_index
-        node.apply_committed_entries()
-        save_full_state(node, node_data_dir)
-
-    return new_index
+    # Таймаут коммита: кворум/сеть/падения
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": "commit_timeout",
+            "message": "Command was not committed by majority within timeout",
+            "node_id": node.node_id,
+            "term": node.current_term,
+            "log_index": new_index,
+        },
+    )
 
 
 @router.put("/{key}")
@@ -143,6 +159,21 @@ async def put_value(request: Request, key: str, body: PutRequest) -> Dict[str, A
 @router.get("/{key}")
 async def get_value(request: Request, key: str) -> Dict[str, Any]:
     node = get_raft_node(request)
+
+    # Упрощение для консистентности: читаем только на лидере.
+    # Если хочешь stale reads — можно убрать этот блок.
+    if node.role != RaftRole.LEADER:
+        detail: Dict[str, Any] = {
+            "error": "not_leader",
+            "node_id": node.node_id,
+            "role": node.role.name,
+            "leader_id": node.leader_id,
+        }
+        peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
+        if node.leader_id and node.leader_id in peer_addresses:
+            detail["leader_address"] = peer_addresses[node.leader_id]
+        raise HTTPException(status_code=409, detail=detail)
+
     value = node.state_machine.get(key)
 
     if value is None:
@@ -168,7 +199,7 @@ async def delete_value(request: Request, key: str) -> Dict[str, Any]:
             "role": node.role.name,
             "leader_id": node.leader_id,
         }
-        peer_addresses: Dict[str, str] = request.app.state.peer_addresses
+        peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
         if node.leader_id and node.leader_id in peer_addresses:
             detail["leader_address"] = peer_addresses[node.leader_id]
 

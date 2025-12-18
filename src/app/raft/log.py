@@ -102,3 +102,14 @@ class RaftLog:
                 )
             )
         return cls(entries=entries)
+
+    def entries_from(self, start_index: int) -> List[LogEntry]:
+        """Возвращает срез лога начиная с start_index (включительно)."""
+        if start_index <= 0:
+            start_index = 1
+        offset = start_index - 1
+        if offset < 0:
+            offset = 0
+        if offset >= len(self.entries):
+            return []
+        return list(self.entries[offset:])

@@ -64,6 +64,7 @@ class RaftNode:
 
     state_machine: KeyValueStateMachine = field(default_factory=KeyValueStateMachine)
 
+    # Для лидера (RAFT): состояние репликации
     next_index: Dict[str, int] = field(default_factory=dict)
     match_index: Dict[str, int] = field(default_factory=dict)
 
@@ -198,6 +199,10 @@ class RaftNode:
     ) -> Tuple[int, bool]:
         """
         Обработка RPC AppendEntries (heartbeat + репликация).
+
+        Поддерживаем 2 формата entries:
+          1) старый: entries=[{op:..., key:..., ...}, ...]  -> term берём из RPC
+          2) новый:  entries=[{"term": int, "command": {...}}, ...]
         """
         logger.info(
             "[%s] handle_append_entries: from leader=%s term=%s, my_term=%s, prev_idx=%s, prev_term=%s, entries=%d, leader_commit=%s",
@@ -253,34 +258,56 @@ class RaftNode:
 
         # 4–5. Добавляем новые записи
         next_index = prev_log_index + 1
-        for i, command in enumerate(entries):
+
+        for i, entry in enumerate(entries):
             entry_index = next_index + i
             existing_entry = self.log.get(entry_index)
 
+            # entry может быть либо командой (старый формат),
+            # либо {"term": int, "command": dict} (новый формат)
+            if isinstance(entry, dict) and "command" in entry and "term" in entry:
+                entry_term = int(entry["term"])
+                entry_command = entry["command"]
+            else:
+                entry_term = term  # fallback: term из RPC
+                entry_command = entry
+
             if existing_entry is not None:
-                if existing_entry.term != term:
+                # ВАЖНО: сравниваем по entry_term, а не по RPC term
+                if existing_entry.term != entry_term:
                     logger.info(
                         "[%s] log conflict at index %s: %s != %s, truncating",
                         self.node_id,
                         entry_index,
                         existing_entry.term,
-                        term,
+                        entry_term,
                     )
+                    # Обрезаем хвост и дописываем все оставшиеся entries
                     self.log.truncate_from(entry_index)
+
                     new_entries: List[LogEntry] = []
                     for j in range(i, len(entries)):
-                        cmd = entries[j]
+                        e = entries[j]
+                        if isinstance(e, dict) and "command" in e and "term" in e:
+                            e_term = int(e["term"])
+                            e_cmd = e["command"]
+                        else:
+                            e_term = term
+                            e_cmd = e
+
                         new_entries.append(
                             LogEntry(
-                                term=term,
-                                index=entry_index + (j - i),
-                                command=cmd,
+                                term=e_term,
+                                index=next_index + j,
+                                command=e_cmd,
                             )
                         )
-                    self.log.append(new_entries)
+
+                    if new_entries:
+                        self.log.append(new_entries)
                     break
             else:
-                new_entry = LogEntry(term=term, index=entry_index, command=command)
+                new_entry = LogEntry(term=entry_term, index=entry_index, command=entry_command)
                 self.log.append([new_entry])
 
         # 6. Обновляем commitIndex
