@@ -30,8 +30,6 @@ async def _send_install_snapshot(
     Шлём snapshot на peer. Snapshot должен соответствовать node.log.base_index.
     """
     if node.snapshot_state is None:
-        # Нечего послать (не создавали snapshot) — значит это ошибка логики,
-        # но мягко фейлим и дадим обычному backtracking продолжить.
         return False
 
     payload = {
@@ -42,7 +40,16 @@ async def _send_install_snapshot(
         "state": node.snapshot_state,
     }
 
-    resp = await client.post(f"{base_url}/raft/install_snapshot", json=payload)
+    try:
+        resp = await client.post(f"{base_url}/raft/install_snapshot", json=payload)
+    except (httpx.HTTPError, OSError) as e:
+        logger.warning(
+            "install_snapshot to %s failed: %r",
+            peer_id,
+            e,
+        )
+        return False
+
     if resp.status_code != 200:
         return False
 
@@ -55,7 +62,6 @@ async def _send_install_snapshot(
         return False
 
     if success:
-        # peer гарантированно имеет state до base_index
         node.match_index[peer_id] = max(node.match_index.get(peer_id, 0), node.log.base_index)
         node.next_index[peer_id] = max(node.next_index.get(peer_id, 1), node.log.base_index + 1)
         return True
