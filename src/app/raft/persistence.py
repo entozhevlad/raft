@@ -52,6 +52,7 @@ def _write_json(path: str, data: Any) -> None:
 
 # ==== ЗАГРУЗКА ====
 
+
 def load_node_state(node: RaftNode, node_dir: str) -> None:
     """
     Загружает состояние узла (term, voted_for, log, kv) из файлов, если они есть.
@@ -60,12 +61,15 @@ def load_node_state(node: RaftNode, node_dir: str) -> None:
     # metadata
     meta_path = os.path.join(node_dir, METADATA_FILE)
     meta = _read_json(meta_path) or {}
-    term = int(meta.get("current_term", 0) or 0)
-    voted_for = meta.get("voted_for", None)
 
-    if term > 0:
-        node.current_term = term
-        node.voted_for = voted_for
+    # Персистентное (RAFT): current_term/voted_for.
+    # Дополнительно (наш пункт 2): commit_index/last_applied,
+    # чтобы после рестарта не применять уже применённые записи повторно.
+    node.current_term = int(meta.get("current_term", 0) or 0)
+    node.voted_for = meta.get("voted_for", None)
+
+    node.commit_index = int(meta.get("commit_index", 0) or 0)
+    node.last_applied = int(meta.get("last_applied", 0) or 0)
 
     # log
     log_path = os.path.join(node_dir, LOG_FILE)
@@ -73,12 +77,17 @@ def load_node_state(node: RaftNode, node_dir: str) -> None:
     if isinstance(log_data, list):
         node.log = RaftLog.from_serializable(log_data)
 
+    # Санитизируем индексы относительно лога.
+    if node.commit_index > node.log.last_index():
+        node.commit_index = node.log.last_index()
+    if node.last_applied > node.commit_index:
+        node.last_applied = node.commit_index
+
     # kv
     kv_path = os.path.join(node_dir, KV_FILE)
     kv_data = _read_json(kv_path)
     if isinstance(kv_data, dict):
         node.state_machine.load_state(kv_data)
-
 
 # ==== СОХРАНЕНИЕ ====
 
@@ -87,6 +96,9 @@ def save_metadata(node: RaftNode, node_dir: str) -> None:
     data = {
         "current_term": node.current_term,
         "voted_for": node.voted_for,
+        # (2) Persist volatile индексы, чтобы пережить рестарт без повторного apply.
+        "commit_index": node.commit_index,
+        "last_applied": node.last_applied,
     }
     _write_json(meta_path, data)
 

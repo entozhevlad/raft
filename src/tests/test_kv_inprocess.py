@@ -7,7 +7,7 @@
 # чтобы проверить работу KV-слоя и интеграцию с RAFT-логом.
 
 from __future__ import annotations
-
+import os
 from fastapi.testclient import TestClient
 
 from src.app.main import create_app
@@ -80,3 +80,52 @@ def test_kv_put_get_delete_single_node():
     # GET после удаления -> 404
     r_get2 = client.get(f"/kv/{key}")
     assert r_get2.status_code == 404
+
+def test_restart_persists_commit_index_and_last_applied(tmp_path, monkeypatch):
+    """(2) После рестарта узел не должен повторно применять уже применённые записи.
+
+    Проверяем два инварианта:
+      1) commit_index и last_applied сохраняются и восстанавливаются.
+      2) повторный вызов apply_committed_entries() после рестарта не меняет last_applied.
+    """
+    # Изолируем персистентность для теста.
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NODE_ID", "node_test")
+    monkeypatch.setenv("PEERS", "")
+
+    # --- Первый запуск ---
+    app1 = create_app()
+    node1 = app1.state.raft_node
+    node1.role = RaftRole.LEADER
+    node1.leader_id = node1.node_id
+    client1 = TestClient(app1)
+
+    key = "k"
+    value = {"v": 1}
+    r_put = client1.put(f"/kv/{key}", json={"value": value})
+    assert r_put.status_code == 200, r_put.text
+
+    st1 = client1.get("/raft/status").json()
+    assert st1["commit_index"] > 0
+    assert st1["commit_index"] == st1["last_applied"]
+
+    # --- "Рестарт" (новый объект приложения/узла, тот же DATA_DIR) ---
+    app2 = create_app()
+    node2 = app2.state.raft_node
+    node2.role = RaftRole.LEADER
+    node2.leader_id = node2.node_id
+    client2 = TestClient(app2)
+
+    # KV не должен измениться.
+    r_get = client2.get(f"/kv/{key}")
+    assert r_get.status_code == 200, r_get.text
+    assert r_get.json()["value"] == value
+
+    st2 = client2.get("/raft/status").json()
+    assert st2["commit_index"] == st1["commit_index"]
+    assert st2["last_applied"] == st1["last_applied"]
+
+    # Повторный apply после рестарта не должен ничего "доприменять".
+    before = node2.last_applied
+    node2.apply_committed_entries()
+    assert node2.last_applied == before
