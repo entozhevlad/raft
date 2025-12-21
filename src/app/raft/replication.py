@@ -19,6 +19,50 @@ def _serialize_entries(node: RaftNode, start_index: int) -> List[Dict]:
     return out
 
 
+async def _send_install_snapshot(
+    *,
+    client: httpx.AsyncClient,
+    node: RaftNode,
+    peer_id: str,
+    base_url: str,
+) -> bool:
+    """
+    Шлём snapshot на peer. Snapshot должен соответствовать node.log.base_index.
+    """
+    if node.snapshot_state is None:
+        # Нечего послать (не создавали snapshot) — значит это ошибка логики,
+        # но мягко фейлим и дадим обычному backtracking продолжить.
+        return False
+
+    payload = {
+        "term": node.current_term,
+        "leader_id": node.node_id,
+        "last_included_index": node.log.base_index,
+        "last_included_term": node.log.base_term,
+        "state": node.snapshot_state,
+    }
+
+    resp = await client.post(f"{base_url}/raft/install_snapshot", json=payload)
+    if resp.status_code != 200:
+        return False
+
+    data = resp.json()
+    resp_term = int(data.get("term", node.current_term))
+    success = bool(data.get("success", False))
+
+    if resp_term > node.current_term:
+        node.become_follower(resp_term)
+        return False
+
+    if success:
+        # peer гарантированно имеет state до base_index
+        node.match_index[peer_id] = max(node.match_index.get(peer_id, 0), node.log.base_index)
+        node.next_index[peer_id] = max(node.next_index.get(peer_id, 1), node.log.base_index + 1)
+        return True
+
+    return False
+
+
 async def replicate_to_peer(
     *,
     client: httpx.AsyncClient,
@@ -46,6 +90,18 @@ async def replicate_to_peer(
             return False
 
         next_idx = max(1, node.next_index.get(peer_id, 1))
+        if next_idx <= node.log.base_index:
+            ok = await _send_install_snapshot(
+                client=client,
+                node=node,
+                peer_id=peer_id,
+                base_url=base_url,
+            )
+            if not ok:
+                return False
+            # после snapshot повторим цикл (теперь next_index должен быть base_index+1)
+            await asyncio.sleep(0)
+            continue
         prev_idx = next_idx - 1
         prev_term = node.log.term_at(prev_idx)
         entries = _serialize_entries(node, next_idx)

@@ -64,6 +64,9 @@ class RaftNode:
 
     state_machine: KeyValueStateMachine = field(default_factory=KeyValueStateMachine)
 
+    # Состояние snapshot на log.base_index (важно: НЕ текущее KV, а именно снапшотное)
+    snapshot_state: Optional[Dict[str, Any]] = None
+
     # Для лидера (RAFT): состояние репликации
     next_index: Dict[str, int] = field(default_factory=dict)
     match_index: Dict[str, int] = field(default_factory=dict)
@@ -344,3 +347,91 @@ class RaftNode:
                 entry.command,
             )
             self.state_machine.apply(entry.command)
+
+    # ================== SNAPSHOT / INSTALLSNAPSHOT ==================
+
+    def maybe_create_snapshot(self, *, threshold: int) -> bool:
+        """
+        Если с момента последнего snapshot накопилось >= threshold применённых записей,
+        делаем snapshot на last_applied и компактим лог.
+        """
+        if threshold <= 0:
+            return False
+
+        # Сколько записей применено поверх base_index
+        if (self.last_applied - self.log.base_index) < threshold:
+            return False
+
+        last_included_index = self.last_applied
+        last_included_term = self.log.term_at(last_included_index)
+
+        # snapshot_state должен соответствовать last_included_index
+        self.snapshot_state = self.state_machine.export_state()
+
+        self.log.compact_upto(last_included_index, last_included_term)
+
+        # После снапшота base_index совпадает с last_included_index, так и нужно
+        if self.commit_index < self.log.base_index:
+            self.commit_index = self.log.base_index
+        if self.last_applied < self.log.base_index:
+            self.last_applied = self.log.base_index
+
+        logger.info(
+            "[%s] snapshot created: last_included_index=%s last_included_term=%s (log compacted)",
+            self.node_id,
+            self.log.base_index,
+            self.log.base_term,
+        )
+        return True
+
+    def handle_install_snapshot(
+        self,
+        *,
+        term: int,
+        leader_id: str,
+        last_included_index: int,
+        last_included_term: int,
+        state: Dict[str, Any],
+    ) -> Tuple[int, bool]:
+        """
+        InstallSnapshot RPC (минимальная версия).
+        """
+        logger.info(
+            "[%s] handle_install_snapshot: from leader=%s term=%s my_term=%s last_included=%s/%s",
+            self.node_id,
+            leader_id,
+            term,
+            self.current_term,
+            last_included_index,
+            last_included_term,
+        )
+
+        if term < self.current_term:
+            return self.current_term, False
+
+        if term > self.current_term:
+            self.become_follower(term, leader_id=leader_id)
+        else:
+            self.role = RaftRole.FOLLOWER
+            self.leader_id = leader_id
+            self.last_heartbeat_ts = time.monotonic()
+
+        # Если снапшот уже не новее — игнорируем как успешный
+        if last_included_index <= self.log.base_index:
+            return self.current_term, True
+
+        # 1) Применяем state machine из snapshot
+        self.state_machine.load_state(state)
+        self.snapshot_state = dict(state)
+
+        # 2) Компактим лог до last_included_index/term
+        # Если в entries есть конфликтующие записи <= last_included_index — они просто исчезнут.
+        self.log.compact_upto(last_included_index, last_included_term)
+
+        # 3) Индексы коммита/применения не должны быть "до" snapshot
+        if self.commit_index < last_included_index:
+            self.commit_index = last_included_index
+        if self.last_applied < last_included_index:
+            self.last_applied = last_included_index
+
+        return self.current_term, True

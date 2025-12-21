@@ -117,3 +117,31 @@ async def raft_status(request: Request) -> Dict[str, Any]:
         "last_log_index": node.log.last_index(),
         "last_log_term": node.log.last_term(),
     }
+
+@router.post("/install_snapshot")
+async def install_snapshot(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+    node = get_raft_node(request)
+
+    try:
+        term = int(body.get("term", 0))
+        leader_id = str(body.get("leader_id"))
+        last_included_index = int(body.get("last_included_index", 0))
+        last_included_term = int(body.get("last_included_term", 0))
+        state = body.get("state") or {}
+
+        resp_term, success = node.handle_install_snapshot(
+            term=term,
+            leader_id=leader_id,
+            last_included_index=last_included_index,
+            last_included_term=last_included_term,
+            state=state if isinstance(state, dict) else {},
+        )
+
+        node_data_dir: str = request.app.state.data_dir
+        save_full_state(node, node_data_dir)
+
+        return {"term": resp_term, "success": success}
+
+    except Exception as exc:
+        logger.exception("[%s] ERROR in /raft/install_snapshot handler: %r", node.node_id, exc)
+        return {"term": node.current_term, "success": False}

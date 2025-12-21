@@ -129,3 +129,47 @@ def test_restart_persists_commit_index_and_last_applied(tmp_path, monkeypatch):
     before = node2.last_applied
     node2.apply_committed_entries()
     assert node2.last_applied == before
+
+def test_snapshot_compaction_and_restart(tmp_path, monkeypatch):
+    """
+    (1) Snapshot/log compaction:
+      - маленький threshold
+      - много PUT
+      - лог компакчен (base_index > 0, entries короткий)
+      - после рестарта state восстановлен и base_index сохраняется
+    """
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("NODE_ID", "node_test")
+    monkeypatch.setenv("PEERS", "")
+    monkeypatch.setenv("SNAPSHOT_THRESHOLD", "3")
+
+    app1 = create_app()
+    node1 = app1.state.raft_node
+    node1.role = RaftRole.LEADER
+    node1.leader_id = node1.node_id
+    client1 = TestClient(app1)
+
+    # 5 команд -> при threshold=3 должен появиться snapshot и compaction
+    for i in range(5):
+        r = client1.put(f"/kv/k{i}", json={"value": {"v": i}})
+        assert r.status_code == 200, r.text
+
+    assert node1.log.base_index >= 3
+    assert len(node1.log.entries) <= 2  # хвост после snapshot
+
+    # рестарт
+    app2 = create_app()
+    node2 = app2.state.raft_node
+    node2.role = RaftRole.LEADER
+    node2.leader_id = node2.node_id
+    client2 = TestClient(app2)
+
+    assert node2.log.base_index == node1.log.base_index
+    # проверяем пару ключей
+    r0 = client2.get("/kv/k0")
+    assert r0.status_code == 200
+    assert r0.json()["value"] == {"v": 0}
+
+    r4 = client2.get("/kv/k4")
+    assert r4.status_code == 200
+    assert r4.json()["value"] == {"v": 4}
