@@ -7,12 +7,14 @@
 # чтобы проверить работу KV-слоя и интеграцию с RAFT-логом.
 
 from __future__ import annotations
-import os
 from fastapi.testclient import TestClient
 
 from src.app.main import create_app
-from src.app.raft.node import RaftRole
+import asyncio
+import httpx
 
+from src.app.api.kv_routes import _confirm_leader_quorum
+from src.app.raft.node import RaftNode, RaftRole
 
 def create_single_node_client() -> TestClient:
     """
@@ -173,3 +175,66 @@ def test_snapshot_compaction_and_restart(tmp_path, monkeypatch):
     r4 = client2.get("/kv/k4")
     assert r4.status_code == 200
     assert r4.json()["value"] == {"v": 4}
+
+
+
+
+def test_readindex_quorum_ok():
+    node = RaftNode(node_id="n1", peers=["n2", "n3"])
+    node.role = RaftRole.LEADER
+    node.leader_id = "n1"
+    node.current_term = 5
+
+    peer_addresses = {"n2": "http://n2:8000", "n3": "http://n3:8000"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"term": 5, "success": True})
+
+    transport = httpx.MockTransport(handler)
+
+    async def run():
+        async with httpx.AsyncClient(transport=transport) as client:
+            await _confirm_leader_quorum(
+                node=node,
+                peer_addresses=peer_addresses,
+                timeout_s=0.2,
+                client=client,
+            )
+
+    asyncio.run(run())
+
+
+def test_readindex_rejects_stale_leader_on_higher_term():
+    node = RaftNode(node_id="n1", peers=["n2", "n3"])
+    node.role = RaftRole.LEADER
+    node.leader_id = "n1"
+    node.current_term = 5
+
+    peer_addresses = {"n2": "http://n2:8000", "n3": "http://n3:8000"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Один peer отвечает term выше -> лидер должен стать follower
+        host = request.url.host
+        if host == "n3":
+            return httpx.Response(200, json={"term": 6, "success": False})
+        return httpx.Response(200, json={"term": 5, "success": True})
+
+    transport = httpx.MockTransport(handler)
+
+    async def run():
+        async with httpx.AsyncClient(transport=transport) as client:
+            try:
+                await _confirm_leader_quorum(
+                    node=node,
+                    peer_addresses=peer_addresses,
+                    timeout_s=0.2,
+                    client=client,
+                )
+                assert False, "Expected stale_leader"
+            except Exception as exc:
+                # FastAPI HTTPException
+                assert getattr(exc, "status_code", None) == 409
+                assert node.role == RaftRole.FOLLOWER
+                assert node.current_term == 6
+
+    asyncio.run(run())
