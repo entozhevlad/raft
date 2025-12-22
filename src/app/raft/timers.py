@@ -52,11 +52,44 @@ def setup_raft_background_tasks(app: FastAPI) -> None:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def _request_vote_rpc(
+    *,
+    client: httpx.AsyncClient,
+    node: RaftNode,
+    peer_id: str,
+    base_url: str,
+    current_term: int,
+    last_index: int,
+    last_term: int,
+) -> tuple[str, int, bool]:
+    """
+    Один RequestVote RPC.
+    Возвращает (peer_id, resp_term, vote_granted).
+    Исключения пробрасываем наверх (их обработает caller).
+    """
+    req = RequestVoteRequest(
+        term=current_term,
+        candidate_id=node.node_id,
+        last_log_index=last_index,
+        last_log_term=last_term,
+    )
+
+    resp = await client.post(f"{base_url}/raft/request_vote", json=req.model_dump())
+    if resp.status_code != 200:
+        return peer_id, current_term, False
+
+    data = resp.json()
+    resp_term = int(data.get("term", current_term))
+    vote_granted = bool(data.get("vote_granted", False))
+    return peer_id, resp_term, vote_granted
+
+
 async def election_loop(app: FastAPI, node: RaftNode) -> None:
     """
     Цикл выборов:
       - ждём случайный таймаут
       - если за это время не было heartbeat и мы не лидер — начинаем выборы
+      - RequestVote шлём параллельно
     """
     peer_addresses: Dict[str, str] = app.state.peer_addresses  # type: ignore[assignment]
     node_data_dir: str = app.state.data_dir  # type: ignore[assignment]
@@ -70,7 +103,6 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
 
         now = time.monotonic()
         if now - node.last_heartbeat_ts < timeout:
-            # недавно приходил heartbeat или проходили выборы
             continue
 
         # Старт выборов
@@ -80,7 +112,6 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
         current_term = node.current_term
         last_index, last_term = node.last_log_index_term()
 
-        # Вместо "majority по всем peer_addresses" считаем кворум по текущей конфигурации
         votes_granted_by = {node.node_id}  # голос за себя
 
         logger.info(
@@ -90,48 +121,53 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
             sorted(list(node.voting_members())),
         )
 
+        # Кому вообще шлём RequestVote
+        targets: list[tuple[str, str]] = []
+        for peer_id, base_url in peer_addresses.items():
+            if peer_id == node.node_id:
+                continue
+            if peer_id not in node.voting_members():
+                continue
+            targets.append((peer_id, base_url))
+
+        if not targets:
+            # одиночный узел или никого нет в voting_members
+            if node.role == RaftRole.CANDIDATE and node.current_term == current_term:
+                node.become_leader()
+            continue
+
         async with httpx.AsyncClient(timeout=1.0) as client:
-            for peer_id, base_url in peer_addresses.items():
-                # Шлём RequestVote только voting members (и не себе)
-                if peer_id == node.node_id:
-                    continue
-                if peer_id not in node.voting_members():
-                    continue
-
-                if node.role != RaftRole.CANDIDATE or node.current_term != current_term:
-                    break
-
-                req = RequestVoteRequest(
-                    term=current_term,
-                    candidate_id=node.node_id,
-                    last_log_index=last_index,
-                    last_log_term=last_term,
+            tasks = [
+                asyncio.create_task(
+                    _request_vote_rpc(
+                        client=client,
+                        node=node,
+                        peer_id=peer_id,
+                        base_url=base_url,
+                        current_term=current_term,
+                        last_index=last_index,
+                        last_term=last_term,
+                    ),
+                    name=f"request_vote-{node.node_id}-to-{peer_id}-t{current_term}",
                 )
+                for peer_id, base_url in targets
+            ]
 
-                try:
-                    logger.info(
-                        "[%s] -> RequestVote to %s at %s",
-                        node.node_id,
-                        peer_id,
-                        base_url,
-                    )
-                    resp = await client.post(
-                        f"{base_url}/raft/request_vote",
-                        json=req.model_dump(),
-                    )
-                    logger.info(
-                        "[%s] <- resp from %s: %s",
-                        node.node_id,
-                        peer_id,
-                        resp.status_code,
-                    )
+            try:
+                for fut in asyncio.as_completed(tasks):
+                    # Если мы уже не кандидат/term сменился — прекращаем обработку
+                    if node.role != RaftRole.CANDIDATE or node.current_term != current_term:
+                        break
 
-                    if resp.status_code != 200:
+                    try:
+                        peer_id, resp_term, vote_granted = await fut
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] RequestVote task failed: %r",
+                            node.node_id,
+                            exc,
+                        )
                         continue
-
-                    data = resp.json()
-                    resp_term = int(data.get("term", current_term))
-                    vote_granted = bool(data.get("vote_granted", False))
 
                     if resp_term > node.current_term:
                         node.become_follower(resp_term)
@@ -149,16 +185,15 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
                         if node.has_election_quorum(votes_granted_by):
                             node.become_leader()
                             break
+            finally:
+                # отменяем оставшиеся RPC, если они ещё живы
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
-                except Exception as exc:
-                    logger.warning(
-                        "[%s] RequestVote to %s failed: %r",
-                        node.node_id,
-                        peer_id,
-                        exc,
-                    )
-                    continue
-
+        # На всякий случай (если кворум набран, но не успели перейти в лидера внутри цикла)
         if (
             node.role == RaftRole.CANDIDATE
             and node.current_term == current_term
