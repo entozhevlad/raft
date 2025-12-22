@@ -155,21 +155,25 @@ async def replicate_to_peer(
     return False
 
 
-def advance_commit_index(node: RaftNode, *, cluster_size: int) -> Optional[int]:
-    """
-    Продвигает commit_index по правилу RAFT:
-    коммитим N, если N реплицирован на majority и term(N) == currentTerm.
+def advance_commit_index(node: RaftNode, *, cluster_size: int | None = None) -> Optional[int]:
+    """Продвигает commit_index по правилу RAFT с учётом joint consensus.
+
+    Коммитим N, если:
+      1) term(N) == currentTerm
+      2) N реплицирован на кворуме voting members.
+         В joint-конфигурации — кворум и в old, и в new.
+
+    Примечание: cluster_size оставлен для обратной совместимости (не используется).
     """
     if node.role != RaftRole.LEADER:
         return None
 
-    majority = cluster_size // 2 + 1
-    match_indexes = [node.log.last_index()] + [node.match_index.get(p, 0) for p in node.peers]
-    match_indexes.sort(reverse=True)
+    last = node.log.last_index()
+    for n in range(last, node.commit_index, -1):
+        if node.log.term_at(n) != node.current_term:
+            continue
+        if node.has_commit_quorum(n):
+            node.commit_index = n
+            return n
 
-    n = match_indexes[majority - 1] if len(match_indexes) >= majority else 0
-
-    if n > node.commit_index and node.log.term_at(n) == node.current_term:
-        node.commit_index = n
-        return n
     return None

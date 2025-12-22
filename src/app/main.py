@@ -36,6 +36,8 @@ def create_app() -> FastAPI:
 
     # === Инициализация RAFT-узла ===
     raft_node = RaftNode(node_id=config.node_id, peers=config.peers)
+    raft_node.members = {config.node_id} | set(config.peers)
+    raft_node.peer_addresses = dict(config.peer_addresses)
 
     # Каталог для состояния этого узла
     node_data_dir = ensure_node_data_dir(config.data_dir, config.node_id)
@@ -45,7 +47,7 @@ def create_app() -> FastAPI:
 
     # Кладём узел и настройки в state приложения.
     app.state.raft_node = raft_node
-    app.state.peer_addresses = config.peer_addresses
+    app.state.peer_addresses = raft_node.peer_addresses
     app.state.data_dir = node_data_dir
 
     # === Фоновые задачи RAFT (выборы + heartbeat) ===

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict
 
 from src.app.raft.log import RaftLog
 from src.app.raft.node import RaftNode
@@ -56,6 +56,7 @@ def _write_json(path: str, data: Any) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, path)
 
+
 # ==== ЗАГРУЗКА ====
 
 def load_node_state(node: RaftNode, node_dir: str) -> None:
@@ -88,6 +89,32 @@ def load_node_state(node: RaftNode, node_dir: str) -> None:
     node.commit_index = int(meta.get("commit_index", 0) or 0)
     node.last_applied = int(meta.get("last_applied", 0) or 0)
 
+    # 1b) dynamic membership (backward compatible)
+    members = meta.get("members")
+    if isinstance(members, list) and members:
+        node.members = set(map(str, members))
+        node.peers = sorted(list(node.members - {node.node_id}))
+
+    peer_addrs = meta.get("peer_addresses")
+    if isinstance(peer_addrs, dict):
+        # merge into existing (init from env/config)
+        for k, v in peer_addrs.items():
+            if k and k != node.node_id and isinstance(v, str) and v:
+                node.peer_addresses[str(k)] = v
+
+    joint_old = meta.get("joint_old")
+    joint_new = meta.get("joint_new")
+    if (
+        isinstance(joint_old, list)
+        and isinstance(joint_new, list)
+        and joint_old
+        and joint_new
+    ):
+        node.joint_old = set(map(str, joint_old))
+        node.joint_new = set(map(str, joint_new))
+        node.members = set(node.joint_old) | set(node.joint_new)
+        node.peers = sorted(list(node.members - {node.node_id}))
+
     # 2) log
     log_path = os.path.join(node_dir, LOG_FILE)
     log_data = _read_json(log_path)
@@ -115,17 +142,26 @@ def load_node_state(node: RaftNode, node_dir: str) -> None:
     if node.last_applied > node.commit_index:
         node.last_applied = node.commit_index
 
+
 # ==== СОХРАНЕНИЕ ====
 
 def save_metadata(node: RaftNode, node_dir: str) -> None:
     meta_path = os.path.join(node_dir, METADATA_FILE)
-    data = {
+
+    data: Dict[str, Any] = {
         "current_term": node.current_term,
         "voted_for": node.voted_for,
         # (2) Persist volatile индексы, чтобы пережить рестарт без повторного apply.
         "commit_index": node.commit_index,
         "last_applied": node.last_applied,
+
+        # (4) dynamic membership
+        "members": sorted(list(node.members)) if getattr(node, "members", None) else sorted([node.node_id] + list(node.peers)),
+        "peer_addresses": dict(getattr(node, "peer_addresses", {}) or {}),
+        "joint_old": sorted(list(node.joint_old)) if getattr(node, "joint_old", None) else None,
+        "joint_new": sorted(list(node.joint_new)) if getattr(node, "joint_new", None) else None,
     }
+
     _write_json(meta_path, data)
 
 

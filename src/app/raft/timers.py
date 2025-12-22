@@ -80,19 +80,24 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
         current_term = node.current_term
         last_index, last_term = node.last_log_index_term()
 
-        total_nodes = 1 + len(peer_addresses)
-        majority = total_nodes // 2 + 1
-        votes_granted = 1  # голос за себя
+        # Вместо "majority по всем peer_addresses" считаем кворум по текущей конфигурации
+        votes_granted_by = {node.node_id}  # голос за себя
 
         logger.info(
-            "[%s] Start election term=%s, majority=%s",
+            "[%s] Start election term=%s (voting_members=%s)",
             node.node_id,
             current_term,
-            majority,
+            sorted(list(node.voting_members())),
         )
 
         async with httpx.AsyncClient(timeout=1.0) as client:
             for peer_id, base_url in peer_addresses.items():
+                # Шлём RequestVote только voting members (и не себе)
+                if peer_id == node.node_id:
+                    continue
+                if peer_id not in node.voting_members():
+                    continue
+
                 if node.role != RaftRole.CANDIDATE or node.current_term != current_term:
                     break
 
@@ -134,15 +139,14 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
                         break
 
                     if vote_granted:
-                        votes_granted += 1
+                        votes_granted_by.add(peer_id)
                         logger.info(
-                            "[%s] vote from %s (now votes=%s/%s)",
+                            "[%s] vote from %s (votes_by=%s)",
                             node.node_id,
                             peer_id,
-                            votes_granted,
-                            majority,
+                            sorted(list(votes_granted_by)),
                         )
-                        if votes_granted >= majority:
+                        if node.has_election_quorum(votes_granted_by):
                             node.become_leader()
                             break
 
@@ -158,7 +162,7 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
         if (
             node.role == RaftRole.CANDIDATE
             and node.current_term == current_term
-            and votes_granted >= majority
+            and node.has_election_quorum(votes_granted_by)
         ):
             node.become_leader()
 
@@ -171,7 +175,7 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
           2) пытаемся продвинуть commitIndex
           3) применяем закоммиченное к state machine
 
-    Важно: тут heartbeat НЕ шлётся \"всем одинаковый prev_log_index\".
+    Важно: тут heartbeat НЕ шлётся "всем одинаковый prev_log_index".
     Вместо этого используем nextIndex/matchIndex для каждого peer.
     """
     peer_addresses: Dict[str, str] = app.state.peer_addresses  # type: ignore[assignment]
@@ -188,8 +192,13 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
         async with httpx.AsyncClient(timeout=1.0) as client:
             leader_commit = node.commit_index
 
-            # 1) Репликация/heartbeat на peers
+            # 1) Репликация/heartbeat на peers (только voting members текущей конфигурации)
             for peer_id, base_url in peer_addresses.items():
+                if peer_id == node.node_id:
+                    continue
+                if peer_id not in node.voting_members():
+                    continue
+
                 ok = await replicate_to_peer(
                     client=client,
                     node=node,
@@ -215,7 +224,7 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
             if node.role != RaftRole.LEADER:
                 continue
 
-            # 2) Пробуем продвинуть commitIndex по majority
+            # 2) Пробуем продвинуть commitIndex (advance_commit_index теперь должен учитывать joint consensus)
             advanced = advance_commit_index(node, cluster_size=cluster_size)
             if advanced is not None:
                 logger.info(
