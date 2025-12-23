@@ -8,6 +8,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from src.app.api import errors
 from src.app.raft.log import LogEntry
 from src.app.raft.node import RaftNode, RaftRole
 from src.app.raft.persistence import save_full_state, save_metadata
@@ -117,17 +118,19 @@ async def put_value(request: Request, key: str, body: PutRequest) -> Dict[str, A
     node = get_raft_node(request)
 
     if node.role != RaftRole.LEADER:
-        detail: Dict[str, Any] = {
-            "error": "not_leader",
-            "node_id": node.node_id,
-            "role": node.role.name,
-            "leader_id": node.leader_id,
-        }
         peer_addresses: Dict[str, str] = request.app.state.peer_addresses
-        if node.leader_id and node.leader_id in peer_addresses:
-            detail["leader_address"] = peer_addresses[node.leader_id]
-
-        raise HTTPException(status_code=409, detail=detail)
+        leader_addr = (
+            peer_addresses[node.leader_id] if node.leader_id and node.leader_id in peer_addresses else None
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=errors.not_leader(
+                node_id=node.node_id,
+                role=node.role.name,
+                leader_id=node.leader_id,
+                leader_address=leader_addr,
+            ),
+        )
 
     command = {"op": "put", "key": key, "value": body.value}
     log_index = await _replicate_command(request, command)
@@ -159,12 +162,11 @@ async def _confirm_leader_quorum(
     if node.role != RaftRole.LEADER:
         raise HTTPException(
             status_code=409,
-            detail={
-                "error": "not_leader",
-                "node_id": node.node_id,
-                "role": node.role.name,
-                "leader_id": node.leader_id,
-            },
+            detail=errors.not_leader(
+                node_id=node.node_id,
+                role=node.role.name,
+                leader_id=node.leader_id,
+            ),
         )
 
     if len(node.cluster_nodes()) == 1:
@@ -306,7 +308,7 @@ async def get_value(request: Request, key: str) -> Dict[str, Any]:
 
     value = node.state_machine.get(key)
     if value is None:
-        raise HTTPException(status_code=404, detail={"error": "key_not_found", "key": key})
+        raise HTTPException(status_code=404, detail=errors.key_not_found(key))
 
     return {
         "key": key,

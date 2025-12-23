@@ -17,7 +17,7 @@ from src.app.api.raft_routes import router as raft_router
 from src.app.config import load_node_config
 from src.app.raft.node import RaftNode
 from src.app.raft.persistence import ensure_node_data_dir, load_node_state
-from src.app.raft.timers import setup_raft_background_tasks
+from src.app.raft.runtime import setup_runtime
 from src.app.utils.logging import setup_logging
 
 
@@ -50,7 +50,7 @@ def create_app() -> FastAPI:
     app.state.data_dir = node_data_dir
 
     # === Фоновые задачи RAFT (выборы + heartbeat) ===
-    setup_raft_background_tasks(app)
+    setup_runtime(app)
 
     # === Подключаем роутеры ===
     app.include_router(health_router)

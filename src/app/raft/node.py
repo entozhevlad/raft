@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
+import os
 
 from src.app.raft.log import LogEntry, RaftLog
 from src.app.raft.state_machine import KeyValueStateMachine
@@ -93,6 +94,34 @@ class RaftNode:
     def last_log_index_term(self) -> Tuple[int, int]:
         """Возвращает (lastLogIndex, lastLogTerm)."""
         return self.log.last_index(), self.log.last_term()
+
+    def to_status_dict(self) -> Dict[str, Any]:
+        """Сериализует текущий статус узла для API."""
+        return {
+            "node_id": self.node_id,
+            "role": self.role.name,
+            "term": self.current_term,
+            "leader_id": self.leader_id,
+            "commit_index": self.commit_index,
+            "last_applied": self.last_applied,
+            "last_log_index": self.log.last_index(),
+            "last_log_term": self.log.last_term(),
+        }
+
+    def validate_invariants(self) -> None:
+        """Лёгкие проверки индексных инвариантов (опционально включаемые)."""
+        if os.getenv("RAFT_VALIDATE", "0") != "1":
+            return
+        warnings: List[str] = []
+        last_index = self.log.last_index()
+        if self.last_applied > self.commit_index:
+            warnings.append("last_applied > commit_index")
+        if self.commit_index > last_index:
+            warnings.append("commit_index > last_log_index")
+        if self.commit_index < self.log.base_index:
+            warnings.append("commit_index < base_index")
+        if warnings:
+            logger.warning("[%s][%s][term=%s] invariant warnings: %s", self.node_id, self.role.name, self.current_term, "; ".join(warnings))
 
     # ================== ПЕРЕХОДЫ МЕЖДУ РОЛЯМИ ==================
 
@@ -388,6 +417,9 @@ class RaftNode:
             # KV-команды
             self.state_machine.apply(entry.command)
 
+        # Лёгкая проверка инвариантов после применения команд
+        self.validate_invariants()
+
     # ================== SNAPSHOT / INSTALLSNAPSHOT ==================
 
     def maybe_create_snapshot(self, *, threshold: int) -> bool:
@@ -474,4 +506,5 @@ class RaftNode:
         if self.last_applied < last_included_index:
             self.last_applied = last_included_index
 
+        self.validate_invariants()
         return self.current_term, True

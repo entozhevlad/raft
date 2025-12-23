@@ -27,29 +27,22 @@ ELECTION_TIMEOUT_RANGE = (1.5, 3.0)  # секунды
 HEARTBEAT_INTERVAL = 0.5             # секунды
 
 
-def setup_raft_background_tasks(app: FastAPI) -> None:
-    """
-    Вешаем startup/shutdown-обработчики, которые запускают/останавливают
-    фоновые циклы выбора лидера и heartbeat.
-    """
+def start_background_tasks(app: FastAPI, node: RaftNode) -> list[asyncio.Task]:
+    """Создаёт и возвращает фоновые задачи RAFT с понятными именами."""
+    logger.info("[%s] start election timer/heartbeat tasks", node.node_id)
+    tasks = [
+        asyncio.create_task(election_loop(app, node), name=f"election_loop-{node.node_id}"),
+        asyncio.create_task(heartbeat_loop(app, node), name=f"heartbeat_loop-{node.node_id}"),
+    ]
+    return tasks
 
-    @app.on_event("startup")
-    async def _start_raft_tasks() -> None:
-        raft_node: RaftNode = app.state.raft_node  # type: ignore[assignment]
-        logger.info("[%s] Starting RAFT background tasks", raft_node.node_id)
 
-        app.state._raft_tasks = [
-            asyncio.create_task(election_loop(app, raft_node), name=f"election_loop-{raft_node.node_id}"),
-            asyncio.create_task(heartbeat_loop(app, raft_node), name=f"heartbeat_loop-{raft_node.node_id}"),
-        ]
-
-    @app.on_event("shutdown")
-    async def _stop_raft_tasks() -> None:
-        tasks = getattr(app.state, "_raft_tasks", [])
-        for t in tasks:
-            t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+async def stop_background_tasks(tasks: list[asyncio.Task]) -> None:
+    """Останавливает ранее запущенные фоновые задачи."""
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _request_vote_rpc(

@@ -107,16 +107,7 @@ async def append_entries(request: Request, body: Dict[str, Any]) -> Dict[str, An
 @router.get("/status")
 async def raft_status(request: Request) -> Dict[str, Any]:
     node = get_raft_node(request)
-    return {
-        "node_id": node.node_id,
-        "role": node.role.name,
-        "term": node.current_term,
-        "leader_id": node.leader_id,
-        "commit_index": node.commit_index,
-        "last_applied": node.last_applied,
-        "last_log_index": node.log.last_index(),
-        "last_log_term": node.log.last_term(),
-    }
+    return node.to_status_dict()
 
 @router.post("/install_snapshot")
 async def install_snapshot(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
