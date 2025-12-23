@@ -7,14 +7,16 @@
 # чтобы проверить работу KV-слоя и интеграцию с RAFT-логом.
 
 from __future__ import annotations
+
+import asyncio
+
+import httpx
 from fastapi.testclient import TestClient
 
-from src.app.main import create_app
-import asyncio
-import httpx
-
 from src.app.api.kv_routes import _confirm_leader_quorum
+from src.app.main import create_app
 from src.app.raft.node import RaftNode, RaftRole
+
 
 def create_single_node_client() -> TestClient:
     """

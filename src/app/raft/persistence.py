@@ -17,7 +17,6 @@ from typing import Any, Dict
 from src.app.raft.log import RaftLog
 from src.app.raft.node import RaftNode
 
-
 METADATA_FILE = "metadata.json"
 LOG_FILE = "log.json"
 KV_FILE = "kv.json"
@@ -87,7 +86,10 @@ def load_node_state(node: RaftNode, node_dir: str) -> None:
     node.current_term = int(meta.get("current_term", 0) or 0)
     node.voted_for = meta.get("voted_for", None)
     node.commit_index = int(meta.get("commit_index", 0) or 0)
-    node.last_applied = int(meta.get("last_applied", 0) or 0)
+
+    # Вариант A: last_applied НЕ доверяем/не грузим с диска.
+    # После рестарта будем догонять state machine применением лога.
+    node.last_applied = base_index
 
     # 1b) dynamic membership (backward compatible)
     members = meta.get("members")
@@ -153,7 +155,6 @@ def save_metadata(node: RaftNode, node_dir: str) -> None:
         "voted_for": node.voted_for,
         # (2) Persist volatile индексы, чтобы пережить рестарт без повторного apply.
         "commit_index": node.commit_index,
-        "last_applied": node.last_applied,
 
         # (4) dynamic membership
         "members": sorted(list(node.members)) if getattr(node, "members", None) else sorted([node.node_id] + list(node.peers)),

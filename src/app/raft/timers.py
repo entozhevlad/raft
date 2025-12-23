@@ -7,18 +7,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
-import logging
 from typing import Dict
 
 import httpx
 from fastapi import FastAPI
 
-from src.app.raft.persistence import save_metadata, save_full_state
-from src.app.raft.replication import replicate_to_peer, advance_commit_index
 from src.app.raft.models import RequestVoteRequest
 from src.app.raft.node import RaftNode, RaftRole
+from src.app.raft.persistence import save_full_state, save_metadata
+from src.app.raft.replication import advance_commit_index, replicate_to_peer
 
 logger = logging.getLogger("raft")
 

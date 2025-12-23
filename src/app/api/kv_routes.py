@@ -1,14 +1,3 @@
-# src/app/api/kv_routes.py
-#
-# KV-API поверх RAFT:
-#   - PUT    /kv/{key}
-#   - GET    /kv/{key}
-#   - DELETE /kv/{key}
-#
-# PUT/DELETE принимаются только лидером.
-# Лидер записывает команду в журнал, реплицирует её (с догоняющей репликацией)
-# и коммитит только когда запись подтверждена большинством.
-
 from __future__ import annotations
 
 import asyncio
@@ -136,7 +125,7 @@ async def put_value(request: Request, key: str, body: PutRequest) -> Dict[str, A
             "role": node.role.name,
             "leader_id": node.leader_id,
         }
-        peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
+        peer_addresses: Dict[str, str] = request.app.state.peer_addresses
         if node.leader_id and node.leader_id in peer_addresses:
             detail["leader_address"] = peer_addresses[node.leader_id]
 
@@ -201,7 +190,7 @@ async def _confirm_leader_quorum(
 
     async def _ping_peer(peer_id: str, base_url: str) -> bool:
         try:
-            resp = await client.post(f"{base_url}/raft/append_entries", json=payload)  # type: ignore[union-attr]
+            resp = await client.post(f"{base_url}/raft/append_entries", json=payload)
         except (httpx.HTTPError, OSError):
             return False
 

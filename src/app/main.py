@@ -12,12 +12,12 @@
 from fastapi import FastAPI
 
 from src.app.api.healthz import router as health_router
-from src.app.api.raft_routes import router as raft_router
 from src.app.api.kv_routes import router as kv_router
+from src.app.api.raft_routes import router as raft_router
 from src.app.config import load_node_config
 from src.app.raft.node import RaftNode
-from src.app.raft.timers import setup_raft_background_tasks
 from src.app.raft.persistence import ensure_node_data_dir, load_node_state
+from src.app.raft.timers import setup_raft_background_tasks
 from src.app.utils.logging import setup_logging
 
 
@@ -44,7 +44,7 @@ def create_app() -> FastAPI:
 
     # Загружаем состояние, если уже было (после предыдущего запуска)
     load_node_state(raft_node, node_data_dir)
-
+    raft_node.apply_committed_entries()
     # Кладём узел и настройки в state приложения.
     app.state.raft_node = raft_node
     app.state.peer_addresses = raft_node.peer_addresses

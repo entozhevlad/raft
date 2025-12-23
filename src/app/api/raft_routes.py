@@ -3,18 +3,18 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
+from src.app.api.kv_routes import _replicate_command
 from src.app.raft.node import RaftNode, RaftRole
 from src.app.raft.persistence import save_full_state
-from src.app.api.kv_routes import _replicate_command
 
 router = APIRouter(tags=["raft"])
 logger = logging.getLogger("raft")
 
 
 def get_raft_node(request: Request) -> RaftNode:
-    raft_node: RaftNode = request.app.state.raft_node  # type: ignore[assignment]
+    raft_node: RaftNode = request.app.state.raft_node
     return raft_node
 
 
@@ -149,7 +149,7 @@ async def install_snapshot(request: Request, body: Dict[str, Any]) -> Dict[str, 
 
 @router.post("/members/add")
 async def add_member(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
-    """Добавить voting member через joint consensus (упрощённо: одна операция за раз)."""
+    """Добавить voting member через joint consensus."""
     node = get_raft_node(request)
     if node.role != RaftRole.LEADER:
         raise HTTPException(

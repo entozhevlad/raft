@@ -17,11 +17,11 @@
 
 from __future__ import annotations
 
-import time
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.app.raft.log import LogEntry, RaftLog
 from src.app.raft.state_machine import KeyValueStateMachine

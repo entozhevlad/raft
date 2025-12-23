@@ -3,9 +3,8 @@ from __future__ import annotations
 import asyncio
 import time
 
-import pytest
-
 import httpx
+import pytest
 
 from src.app.raft.node import RaftNode, RaftRole
 from src.app.raft.timers import _request_vote_rpc
