@@ -3,10 +3,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 
-from src.app.api.kv_routes import _replicate_command
-from src.app.raft.node import RaftNode, RaftRole
+from src.app.raft.node import RaftNode
 from src.app.raft.persistence import save_full_state
 
 router = APIRouter(tags=["raft"])
@@ -146,99 +145,3 @@ async def install_snapshot(request: Request, body: Dict[str, Any]) -> Dict[str, 
     except Exception as exc:
         logger.exception("[%s] ERROR in /raft/install_snapshot handler: %r", node.node_id, exc)
         return {"term": node.current_term, "success": False}
-
-@router.post("/members/add")
-async def add_member(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
-    """Добавить voting member через joint consensus."""
-    node = get_raft_node(request)
-    if node.role != RaftRole.LEADER:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "not_leader", "node_id": node.node_id, "role": node.role.name, "leader_id": node.leader_id},
-        )
-
-    if node.is_joint():
-        raise HTTPException(status_code=409, detail={"error": "reconfiguration_in_progress"})
-
-    new_id = str(body.get("node_id") or "").strip()
-    addr = str(body.get("address") or "").strip()
-    if not new_id or new_id == node.node_id:
-        raise HTTPException(status_code=400, detail={"error": "invalid_node_id"})
-    if not addr:
-        raise HTTPException(status_code=400, detail={"error": "invalid_address"})
-
-    old = set(node.members) if node.members else ({node.node_id} | set(node.peers))
-    if new_id in old:
-        return {"ok": True, "message": "already_member", "members": sorted(list(old))}
-
-    new = set(old) | {new_id}
-
-    # адрес нужен ДО старта joint-фазы (для репликации на новый узел)
-    request.app.state.peer_addresses[new_id] = addr
-    node.peer_addresses[new_id] = addr
-
-    joint_cmd = {
-        "op": "config",
-        "phase": "joint",
-        "old": sorted(list(old)),
-        "new": sorted(list(new)),
-        "peer_addresses": {new_id: addr},
-    }
-    final_cmd = {
-        "op": "config",
-        "phase": "final",
-        "members": sorted(list(new)),
-        "peer_addresses": dict(request.app.state.peer_addresses),
-    }
-
-    await _replicate_command(request, joint_cmd, commit_timeout_s=5.0)
-    await _replicate_command(request, final_cmd, commit_timeout_s=5.0)
-
-    return {"ok": True, "members": sorted(list(node.voting_members())), "joint": node.is_joint()}
-
-
-@router.post("/members/remove")
-async def remove_member(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
-    """Удалить voting member через joint consensus (упрощённо: одна операция за раз)."""
-    node = get_raft_node(request)
-    if node.role != RaftRole.LEADER:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "not_leader", "node_id": node.node_id, "role": node.role.name, "leader_id": node.leader_id},
-        )
-
-    if node.is_joint():
-        raise HTTPException(status_code=409, detail={"error": "reconfiguration_in_progress"})
-
-    rm_id = str(body.get("node_id") or "").strip()
-    if not rm_id or rm_id == node.node_id:
-        raise HTTPException(status_code=400, detail={"error": "invalid_node_id"})
-
-    old = set(node.members) if node.members else ({node.node_id} | set(node.peers))
-    if rm_id not in old:
-        return {"ok": True, "message": "not_a_member", "members": sorted(list(old))}
-
-    new = set(old)
-    new.remove(rm_id)
-
-    joint_cmd = {
-        "op": "config",
-        "phase": "joint",
-        "old": sorted(list(old)),
-        "new": sorted(list(new)),
-        "peer_addresses": dict(request.app.state.peer_addresses),
-    }
-    final_cmd = {
-        "op": "config",
-        "phase": "final",
-        "members": sorted(list(new)),
-        "peer_addresses": dict(request.app.state.peer_addresses),
-    }
-
-    await _replicate_command(request, joint_cmd, commit_timeout_s=5.0)
-    await _replicate_command(request, final_cmd, commit_timeout_s=5.0)
-
-    request.app.state.peer_addresses.pop(rm_id, None)
-    node.peer_addresses.pop(rm_id, None)
-
-    return {"ok": True, "members": sorted(list(node.voting_members())), "joint": node.is_joint()}

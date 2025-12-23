@@ -115,10 +115,10 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
         votes_granted_by = {node.node_id}  # голос за себя
 
         logger.info(
-            "[%s] Start election term=%s (voting_members=%s)",
+            "[%s] Start election term=%s (cluster=%s)",
             node.node_id,
             current_term,
-            sorted(list(node.voting_members())),
+            sorted(list(node.cluster_nodes())),
         )
 
         # Кому вообще шлём RequestVote
@@ -126,12 +126,10 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
         for peer_id, base_url in peer_addresses.items():
             if peer_id == node.node_id:
                 continue
-            if peer_id not in node.voting_members():
-                continue
             targets.append((peer_id, base_url))
 
         if not targets:
-            # одиночный узел или никого нет в voting_members
+            # одиночный узел
             if node.role == RaftRole.CANDIDATE and node.current_term == current_term:
                 node.become_leader()
             continue
@@ -182,7 +180,7 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
                             peer_id,
                             sorted(list(votes_granted_by)),
                         )
-                        if node.has_election_quorum(votes_granted_by):
+                        if len(votes_granted_by) >= node.majority():
                             node.become_leader()
                             break
             finally:
@@ -197,7 +195,7 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
         if (
             node.role == RaftRole.CANDIDATE
             and node.current_term == current_term
-            and node.has_election_quorum(votes_granted_by)
+            and len(votes_granted_by) >= node.majority()
         ):
             node.become_leader()
 
@@ -230,8 +228,6 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
             # 1) Репликация/heartbeat на peers (только voting members текущей конфигурации)
             for peer_id, base_url in peer_addresses.items():
                 if peer_id == node.node_id:
-                    continue
-                if peer_id not in node.voting_members():
                     continue
 
                 ok = await replicate_to_peer(

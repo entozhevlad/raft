@@ -91,31 +91,12 @@ def load_node_state(node: RaftNode, node_dir: str) -> None:
     # После рестарта будем догонять state machine применением лога.
     node.last_applied = base_index
 
-    # 1b) dynamic membership (backward compatible)
-    members = meta.get("members")
-    if isinstance(members, list) and members:
-        node.members = set(map(str, members))
-        node.peers = sorted(list(node.members - {node.node_id}))
-
     peer_addrs = meta.get("peer_addresses")
     if isinstance(peer_addrs, dict):
         # merge into existing (init from env/config)
         for k, v in peer_addrs.items():
             if k and k != node.node_id and isinstance(v, str) and v:
                 node.peer_addresses[str(k)] = v
-
-    joint_old = meta.get("joint_old")
-    joint_new = meta.get("joint_new")
-    if (
-        isinstance(joint_old, list)
-        and isinstance(joint_new, list)
-        and joint_old
-        and joint_new
-    ):
-        node.joint_old = set(map(str, joint_old))
-        node.joint_new = set(map(str, joint_new))
-        node.members = set(node.joint_old) | set(node.joint_new)
-        node.peers = sorted(list(node.members - {node.node_id}))
 
     # 2) log
     log_path = os.path.join(node_dir, LOG_FILE)
@@ -155,12 +136,9 @@ def save_metadata(node: RaftNode, node_dir: str) -> None:
         "voted_for": node.voted_for,
         # (2) Persist volatile индексы, чтобы пережить рестарт без повторного apply.
         "commit_index": node.commit_index,
-
-        # (4) dynamic membership
-        "members": sorted(list(node.members)) if getattr(node, "members", None) else sorted([node.node_id] + list(node.peers)),
+        # Статическая конфигурация (для совместимости рестартов)
+        "members": sorted([node.node_id] + list(node.peers)),
         "peer_addresses": dict(getattr(node, "peer_addresses", {}) or {}),
-        "joint_old": sorted(list(node.joint_old)) if getattr(node, "joint_old", None) else None,
-        "joint_new": sorted(list(node.joint_new)) if getattr(node, "joint_new", None) else None,
     }
 
     _write_json(meta_path, data)

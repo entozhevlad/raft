@@ -10,10 +10,8 @@
 #   - применение закоммиченных записей к KV state machine
 #
 # Добавлено для пункта (4):
-#   - динамическое членство: members, peer_addresses
-#   - joint consensus: joint_old/joint_new + правила кворума
-#   - защита: отвергаем RV/AE от узлов вне voting_members()
-#   - применение config-команд при apply_committed_entries()
+#   - статический состав кластера из NODE_ID + PEERS (env)
+#   - защита: отвергаем RPC от узлов вне статического списка
 
 from __future__ import annotations
 
@@ -21,7 +19,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.app.raft.log import LogEntry, RaftLog
 from src.app.raft.state_machine import KeyValueStateMachine
@@ -68,15 +66,8 @@ class RaftNode:
     role: RaftRole = RaftRole.FOLLOWER
     leader_id: Optional[str] = None
 
-    # === Динамическое членство (joint consensus) ===
-    # members: текущее "voting" множество узлов (включая self)
-    # peer_addresses: адреса остальных узлов (не включая self)
-    # joint_old/joint_new: если не None, значит активна joint-конфигурация,
-    # и для выборов/коммита требуется кворум и в old, и в new.
-    members: Set[str] = field(default_factory=set)
+    # Адреса остальных узлов (не включая self)
     peer_addresses: Dict[str, str] = field(default_factory=dict)
-    joint_old: Optional[Set[str]] = None
-    joint_new: Optional[Set[str]] = None
 
     state_machine: KeyValueStateMachine = field(default_factory=KeyValueStateMachine)
 
@@ -91,102 +82,17 @@ class RaftNode:
 
     # ================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==================
 
+    def cluster_nodes(self) -> List[str]:
+        """Статический список узлов: self + peers из конфигурации."""
+        return [self.node_id] + list(self.peers)
+
+    def majority(self) -> int:
+        """Кворум: floor(N/2)+1 для статического кластера."""
+        return len(self.cluster_nodes()) // 2 + 1
+
     def last_log_index_term(self) -> Tuple[int, int]:
         """Возвращает (lastLogIndex, lastLogTerm)."""
         return self.log.last_index(), self.log.last_term()
-
-    # ================== КОНФИГУРАЦИЯ КЛАСТЕРА (JOINT CONSENSUS) ==================
-
-    def is_joint(self) -> bool:
-        return self.joint_old is not None and self.joint_new is not None
-
-    def voting_members(self) -> Set[str]:
-        """Текущее множество серверов, участвующих в RPC (включая self).
-        В joint-конфигурации это union(old, new).
-        """
-        if self.is_joint():
-            return set(self.joint_old or set()) | set(self.joint_new or set())
-
-        # members может быть пустым в старом режиме -> считаем peers + self
-        if self.members:
-            return set(self.members)
-        return {self.node_id} | set(self.peers)
-
-    def _majority(self, config: Set[str]) -> int:
-        return len(config) // 2 + 1
-
-    def _has_quorum(self, granted_by: Set[str], config: Set[str]) -> bool:
-        return len(set(granted_by) & set(config)) >= self._majority(config)
-
-    def has_election_quorum(self, votes_granted_by: Set[str]) -> bool:
-        """Кворум для выборов (учитывает joint consensus)."""
-        if self.is_joint():
-            assert self.joint_old is not None and self.joint_new is not None
-            return self._has_quorum(votes_granted_by, self.joint_old) and self._has_quorum(
-                votes_granted_by, self.joint_new
-            )
-
-        cfg = set(self.members) if self.members else ({self.node_id} | set(self.peers))
-        return self._has_quorum(votes_granted_by, cfg)
-
-    def has_commit_quorum(self, index_n: int) -> bool:
-        """Кворум для коммита конкретного index (учитывает joint consensus)."""
-
-        def replicated_by(node_id: str) -> bool:
-            if node_id == self.node_id:
-                return self.log.last_index() >= index_n
-            return self.match_index.get(node_id, 0) >= index_n
-
-        if self.is_joint():
-            assert self.joint_old is not None and self.joint_new is not None
-            old = set(self.joint_old)
-            new = set(self.joint_new)
-            old_ok = sum(1 for nid in old if replicated_by(nid)) >= self._majority(old)
-            new_ok = sum(1 for nid in new if replicated_by(nid)) >= self._majority(new)
-            return old_ok and new_ok
-
-        cfg = set(self.members) if self.members else ({self.node_id} | set(self.peers))
-        return sum(1 for nid in cfg if replicated_by(nid)) >= self._majority(cfg)
-
-    def apply_cluster_config(self, command: Dict[str, Any]) -> None:
-        """Применяет закоммиченную конфигурацию.
-
-        Форматы:
-          - joint: {op:"config", phase:"joint", old:[...], new:[...], peer_addresses:{...}}
-          - final: {op:"config", phase:"final", members:[...], peer_addresses:{...}}
-        """
-        if command.get("op") != "config":
-            return
-
-        phase = str(command.get("phase") or "")
-        addrs = command.get("peer_addresses")
-        if isinstance(addrs, dict):
-            for k, v in addrs.items():
-                if k and k != self.node_id and isinstance(v, str) and v:
-                    self.peer_addresses[str(k)] = v
-
-        if phase == "joint":
-            old = command.get("old")
-            new = command.get("new")
-            if isinstance(old, list) and isinstance(new, list):
-                self.joint_old = set(map(str, old))
-                self.joint_new = set(map(str, new))
-                self.members = set(self.joint_old) | set(self.joint_new)
-                self.peers = sorted(list(self.members - {self.node_id}))
-
-        if phase == "final":
-            members = command.get("members")
-            if isinstance(members, list):
-                self.members = set(map(str, members))
-                self.joint_old = None
-                self.joint_new = None
-                self.peers = sorted(list(self.members - {self.node_id}))
-
-                # чистим адреса удалённых узлов
-                keep = set(self.peers)
-                for pid in list(self.peer_addresses.keys()):
-                    if pid not in keep:
-                        self.peer_addresses.pop(pid, None)
 
     # ================== ПЕРЕХОДЫ МЕЖДУ РОЛЯМИ ==================
 
@@ -260,11 +166,11 @@ class RaftNode:
         if term > self.current_term:
             self.become_follower(term)
 
-        # 3) Ограничение по членству: голосуем только за voting member текущей конфигурации
-        # (но term уже обновлён, если был выше)
-        if candidate_id not in self.voting_members():
+        # 3) Ограничение по статическому членству: голосуем только за известные узлы
+        allowed = set(self.cluster_nodes())
+        if candidate_id not in allowed:
             logger.info(
-                "[%s] reject vote for %s: not a voting member in current config",
+                "[%s] reject vote for %s: not a member of static cluster",
                 self.node_id,
                 candidate_id,
             )
@@ -360,10 +266,11 @@ class RaftNode:
             self.last_heartbeat_ts = time.monotonic()
 
         # 3) Membership-check после term update:
-        # если отправитель не member — отклоняем, но term уже актуальный
-        if leader_id not in self.voting_members():
+        # если отправитель не member статического кластера — отклоняем, но term уже актуальный
+        allowed = set(self.cluster_nodes())
+        if leader_id not in allowed:
             logger.info(
-                "[%s] reject AppendEntries from %s: not a voting member in current config",
+                "[%s] reject AppendEntries from %s: not a member of static cluster",
                 self.node_id,
                 leader_id,
             )
@@ -480,10 +387,6 @@ class RaftNode:
 
             # KV-команды
             self.state_machine.apply(entry.command)
-
-            # Конфигурационные записи применяем отдельно (KV их игнорирует).
-            if isinstance(entry.command, dict):
-                self.apply_cluster_config(entry.command)
 
     # ================== SNAPSHOT / INSTALLSNAPSHOT ==================
 

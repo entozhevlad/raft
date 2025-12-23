@@ -59,8 +59,6 @@ async def _replicate_command(
     save_metadata(node, node_data_dir)
     save_full_state(node, node_data_dir)
 
-    cluster_size = 1 + len(peer_addresses)
-
     deadline = time.monotonic() + commit_timeout_s
 
     async with httpx.AsyncClient(timeout=1.0) as client:
@@ -90,7 +88,7 @@ async def _replicate_command(
                 )
 
             # 3) Пробуем продвинуть commit_index.
-            advanced = advance_commit_index(node, cluster_size=cluster_size)
+            advanced = advance_commit_index(node)
             if advanced is not None:
                 node.apply_committed_entries()
                 save_full_state(node, node_data_dir)
@@ -169,11 +167,9 @@ async def _confirm_leader_quorum(
             },
         )
 
-    cluster_size = 1 + len(peer_addresses)
-    if cluster_size == 1:
+    if len(node.cluster_nodes()) == 1:
         return
-
-    majority = cluster_size // 2 + 1
+    majority = node.majority()
     term = node.current_term
 
     # Heartbeat payload (без репликации лога)
@@ -270,9 +266,7 @@ async def _ensure_committed_in_current_term(request: Request, *, timeout_s: floa
     """
     node = get_raft_node(request)
     peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
-    cluster_size = 1 + len(peer_addresses)
-
-    if node.role != RaftRole.LEADER or cluster_size == 1:
+    if node.role != RaftRole.LEADER or len(node.cluster_nodes()) == 1:
         return
 
     if node.commit_index == 0 or node.log.term_at(node.commit_index) != node.current_term:
