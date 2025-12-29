@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app.utils import errors
+from src.app.utils import errors
 from src.app.raft.log import LogEntry
 from src.app.raft.node import RaftNode, RaftRole
 from src.app.raft.persistence import save_full_state
@@ -137,13 +137,7 @@ async def _confirm_leader_quorum(
     timeout_s: float = 1.0,
     client: httpx.AsyncClient | None = None,
 ) -> None:
-    """ReadIndex-подобный барьер: подтверждаем, что мы всё ещё лидер на кворуме.
-
-    Идея:
-      - лидер посылает heartbeat (AppendEntries без entries) всем peer'ам
-      - ждём ответы большинства (success=True) в текущем term
-      - если кто-то отвечает term > current_term -> немедленно step down
-    """
+    """Подтверждение лидерского кворума."""
     if node.role != RaftRole.LEADER:
         raise HTTPException(
             status_code=409,
@@ -159,7 +153,6 @@ async def _confirm_leader_quorum(
     majority = node.majority()
     term = node.current_term
 
-    # Heartbeat payload (без репликации лога)
     prev_idx = node.log.last_index()
     prev_term = node.log.term_at(prev_idx)
     payload = {
@@ -188,7 +181,6 @@ async def _confirm_leader_quorum(
             node.become_follower(resp_term)
             return False
 
-        # term и роль должны совпадать с началом барьера
         if node.current_term != term or node.role != RaftRole.LEADER:
             return False
 
@@ -198,7 +190,7 @@ async def _confirm_leader_quorum(
     if owns_client:
         client = httpx.AsyncClient(timeout=timeout_s)
 
-    ok = 1  # self
+    ok = 1
     try:
         tasks = [
             asyncio.create_task(_ping_peer(peer_id, base_url))
@@ -219,7 +211,6 @@ async def _confirm_leader_quorum(
         if owns_client and client is not None:
             await client.aclose()
 
-    # Если во время проверки выяснилось, что term вырос/роль сменилась — это stale leader
     if node.role != RaftRole.LEADER or node.current_term != term:
         raise HTTPException(
             status_code=409,
@@ -247,17 +238,14 @@ async def _confirm_leader_quorum(
 
 
 async def _ensure_committed_in_current_term(request: Request, *, timeout_s: float = 2.0) -> None:
-    """Лениво гарантируем commit записи в текущем term (no-op), как часто делают после election.
+    """Подтверждение лидера."""
 
-    Это помогает сделать ReadIndex безопасным сразу после лидерства, не меняя фоновые таски.
-    """
     node = get_raft_node(request)
-    peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
+    peer_addresses: Dict[str, str] = request.app.state.peer_addresses
     if node.role != RaftRole.LEADER or len(node.get_cluster_nodes()) == 1:
         return
 
     if node.commit_index == 0 or node.log.term_at(node.commit_index) != node.current_term:
-        # no-op команда (state_machine её проигнорирует)
         await _replicate_command(
             request,
             {"op": "noop"},
@@ -268,7 +256,6 @@ async def _ensure_committed_in_current_term(request: Request, *, timeout_s: floa
 async def get_value(request: Request, key: str) -> Dict[str, Any]:
     node = get_raft_node(request)
 
-    # Линейризуемые чтения: только лидер + защита от stale leader.
     if node.role != RaftRole.LEADER:
         detail: Dict[str, Any] = {
             "error": "not_leader",
@@ -276,22 +263,18 @@ async def get_value(request: Request, key: str) -> Dict[str, Any]:
             "role": node.role.name,
             "leader_id": node.leader_id,
         }
-        peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
+        peer_addresses: Dict[str, str] = request.app.state.peer_addresses
         if node.leader_id and node.leader_id in peer_addresses:
             detail["leader_address"] = peer_addresses[node.leader_id]
         raise HTTPException(status_code=409, detail=detail)
 
-    # (0) Гарантируем commit в текущем term (лениво, через noop)
     await _ensure_committed_in_current_term(request)
-
-    # (1) ReadIndex barrier: подтверждаем лидерство на majority
-    peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
+    peer_addresses: Dict[str, str] = request.app.state.peer_addresses
     await _confirm_leader_quorum(node=node, peer_addresses=peer_addresses)
-
-    # (2) Доприменяем всё закоммиченное перед чтением
     node.apply_committed_entries()
 
     value = node.state_machine.get(key)
+
     if value is None:
         raise HTTPException(status_code=404, detail=errors.key_not_found(key))
 
@@ -306,6 +289,7 @@ async def get_value(request: Request, key: str) -> Dict[str, Any]:
 
 @router.delete("/{key}")
 async def delete_value(request: Request, key: str) -> Dict[str, Any]:
+
     node = get_raft_node(request)
 
     if node.role != RaftRole.LEADER:
@@ -315,7 +299,7 @@ async def delete_value(request: Request, key: str) -> Dict[str, Any]:
             "role": node.role.name,
             "leader_id": node.leader_id,
         }
-        peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
+        peer_addresses: Dict[str, str] = request.app.state.peer_addresses
         if node.leader_id and node.leader_id in peer_addresses:
             detail["leader_address"] = peer_addresses[node.leader_id]
 
