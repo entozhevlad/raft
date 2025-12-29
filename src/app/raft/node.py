@@ -43,7 +43,6 @@ class RaftNode:
 
     snapshot_state: Optional[Dict[str, Any]] = None
 
-    # Для лидера (RAFT): состояние репликации
     next_index: Dict[str, int] = field(default_factory=dict)
     match_index: Dict[str, int] = field(default_factory=dict)
 

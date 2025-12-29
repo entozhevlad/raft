@@ -120,10 +120,7 @@ def save_kv_state(node: RaftNode, node_dir: str) -> None:
 
 
 def save_full_state(node: RaftNode, node_dir: str) -> None:
-    """
-    Сохраняет metadata +  + log + kv.
-    """
-    # 1) возможно создаём snapshot и компактим лог
+    """Сохраняет metadata +  + log + kv."""
     try:
         threshold = int(os.getenv("SNAPSHOT_THRESHOLD", "50"))
     except Exception:
@@ -144,11 +141,8 @@ def save_full_state(node: RaftNode, node_dir: str) -> None:
 def save_snapshot(node: RaftNode, node_dir: str) -> None:
     snap_path = os.path.join(node_dir, SNAPSHOT_FILE)
 
-    # snapshot_state обязан соответствовать log.base_index
     state = node.snapshot_state
     if state is None and node.log.base_index > 0:
-        # fallback: если почему-то нет snapshot_state, но base_index уже есть,
-        # сохраняем текущее состояние (лучше, чем ничего)
         state = node.state_machine.export_state()
 
     if node.log.base_index <= 0 and not state:
