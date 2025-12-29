@@ -36,16 +36,16 @@ async def request_vote(request: Request, body: Dict[str, Any]) -> Dict[str, Any]
             last_log_index,
             last_log_term,
         )
+        async with node.lock:
+            resp_term, vote_granted = node.handle_request_vote(
+                term=term,
+                candidate_id=candidate_id,
+                candidate_last_log_index=last_log_index,
+                candidate_last_log_term=last_log_term,
+            )
 
-        resp_term, vote_granted = node.handle_request_vote(
-            term=term,
-            candidate_id=candidate_id,
-            candidate_last_log_index=last_log_index,
-            candidate_last_log_term=last_log_term,
-        )
-
-        node_data_dir: str = request.app.state.data_dir
-        save_full_state(node, node_data_dir)
+            node_data_dir: str = request.app.state.data_dir
+            save_full_state(node, node_data_dir)
 
         return {"term": resp_term, "vote_granted": vote_granted}
 
@@ -78,20 +78,20 @@ async def append_entries(request: Request, body: Dict[str, Any]) -> Dict[str, An
             term,
             len(entries),
         )
+        async with node.lock:
+            resp_term, success = node.handle_append_entries(
+                term=term,
+                leader_id=leader_id,
+                prev_log_index=prev_log_index,
+                prev_log_term=prev_log_term,
+                entries=entries,
+                leader_commit=leader_commit,
+            )
 
-        resp_term, success = node.handle_append_entries(
-            term=term,
-            leader_id=leader_id,
-            prev_log_index=prev_log_index,
-            prev_log_term=prev_log_term,
-            entries=entries,
-            leader_commit=leader_commit,
-        )
+            node.apply_committed_entries()
 
-        node.apply_committed_entries()
-
-        node_data_dir: str = request.app.state.data_dir
-        save_full_state(node, node_data_dir)
+            node_data_dir: str = request.app.state.data_dir
+            save_full_state(node, node_data_dir)
 
         return {"term": resp_term, "success": success}
 
@@ -119,17 +119,17 @@ async def install_snapshot(request: Request, body: Dict[str, Any]) -> Dict[str, 
         last_included_index = int(body.get("last_included_index", 0))
         last_included_term = int(body.get("last_included_term", 0))
         state = body.get("state") or {}
+        async with node.lock:
+            resp_term, success = node.handle_install_snapshot(
+                term=term,
+                leader_id=leader_id,
+                last_included_index=last_included_index,
+                last_included_term=last_included_term,
+                state=state if isinstance(state, dict) else {},
+            )
 
-        resp_term, success = node.handle_install_snapshot(
-            term=term,
-            leader_id=leader_id,
-            last_included_index=last_included_index,
-            last_included_term=last_included_term,
-            state=state if isinstance(state, dict) else {},
-        )
-
-        node_data_dir: str = request.app.state.data_dir
-        save_full_state(node, node_data_dir)
+            node_data_dir: str = request.app.state.data_dir
+            save_full_state(node, node_data_dir)
 
         return {"term": resp_term, "success": success}
 

@@ -32,39 +32,39 @@ async def _replicate_command(
     *,
     commit_timeout_s: float = 3.0,
 ) -> int:
-    """Репликация команды через RAFT."""
-
     node = get_raft_node(request)
-
-    if node.role != RaftRole.LEADER:
-        raise RuntimeError("replicate_command called on non-leader")
-
     peer_addresses: Dict[str, str] = request.app.state.peer_addresses
     node_data_dir: str = request.app.state.data_dir
 
-    new_index = node.log.last_index() + 1
-    entry = LogEntry(term=node.current_term, index=new_index, command=command)
-    node.log.append([entry])
+    async with node.lock:
+        if node.role != RaftRole.LEADER:
+            raise RuntimeError("replicate_command called on non-leader")
 
-    save_full_state(node, node_data_dir)
+        new_index = node.log.last_index() + 1
+        entry = LogEntry(term=node.current_term, index=new_index, command=command)
+        node.log.append([entry])
+        save_full_state(node, node_data_dir)
+
+        op_term = node.current_term
 
     deadline = time.monotonic() + commit_timeout_s
 
     async with httpx.AsyncClient(timeout=1.0) as client:
         while time.monotonic() < deadline:
-            if node.role != RaftRole.LEADER:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "not_leader",
-                        "node_id": node.node_id,
-                        "role": node.role.name,
-                        "leader_id": node.leader_id,
-                    },
-                )
+            async with node.lock:
+                if node.role != RaftRole.LEADER or node.current_term != op_term:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "not_leader",
+                            "node_id": node.node_id,
+                            "role": node.role.name,
+                            "leader_id": node.leader_id,
+                        },
+                    )
+                leader_commit = node.commit_index
 
-            leader_commit = node.commit_index
-
+            # репликация по сети без lock
             for peer_id, base_url in peer_addresses.items():
                 await replicate_to_peer(
                     client=client,
@@ -74,13 +74,18 @@ async def _replicate_command(
                     leader_commit=leader_commit,
                 )
 
-            advanced = advance_commit_index(node)
-            if advanced is not None:
-                node.apply_committed_entries()
-                save_full_state(node, node_data_dir)
+            # commit/apply под lock
+            async with node.lock:
+                if node.role != RaftRole.LEADER or node.current_term != op_term:
+                    continue
 
-            if node.commit_index >= new_index:
-                return new_index
+                advanced = advance_commit_index(node)
+                if advanced is not None:
+                    node.apply_committed_entries()
+                    save_full_state(node, node_data_dir)
+
+                if node.commit_index >= new_index:
+                    return new_index
 
             await asyncio.sleep(0.05)
 
@@ -270,9 +275,10 @@ async def get_value(request: Request, key: str) -> Dict[str, Any]:
     await _ensure_committed_in_current_term(request)
     peer_addresses: Dict[str, str] = request.app.state.peer_addresses
     await _confirm_leader_quorum(node=node, peer_addresses=peer_addresses)
-    node.apply_committed_entries()
 
-    value = node.state_machine.get(key)
+    async with node.lock:
+        node.apply_committed_entries()
+        value = node.state_machine.get(key)
 
     if value is None:
         raise HTTPException(status_code=404, detail=errors.key_not_found(key))

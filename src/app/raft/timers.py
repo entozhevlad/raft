@@ -22,7 +22,7 @@ HEARTBEAT_INTERVAL = 0.5
 
 
 def start_background_tasks(app: FastAPI, node: RaftNode) -> list[asyncio.Task]:
-    """Запуск election_loop и heartbead_loop в фоне."""
+    """Запуск election_loop и heartbeat_loop в фоне."""
     logger.info("[%s] start election timer/heartbeat tasks", node.node_id)
     tasks = [
         asyncio.create_task(election_loop(app, node), name=f"election_loop-{node.node_id}"),
@@ -50,7 +50,6 @@ async def _request_vote_rpc(
     last_term: int,
 ) -> tuple[str, int, bool]:
     """Запросить голос у ноды."""
-
     req = RequestVoteRequest(
         term=current_term,
         candidate_id=node.node_id,
@@ -69,7 +68,7 @@ async def _request_vote_rpc(
 
 
 async def election_loop(app: FastAPI, node: RaftNode) -> None:
-    """Функция цикла выборов."""
+    """Цикл выборов."""
     peer_addresses: Dict[str, str] = app.state.peer_addresses
     node_data_dir: str = app.state.data_dir
 
@@ -77,20 +76,20 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
         timeout = random.uniform(*ELECTION_TIMEOUT_RANGE)
         await asyncio.sleep(timeout)
 
-        if node.role == RaftRole.LEADER:
-            continue
+        async with node.lock:
+            if node.role == RaftRole.LEADER:
+                continue
 
-        now = time.monotonic()
-        if now - node.last_heartbeat_ts < timeout:
-            continue
+            now = time.monotonic()
+            if now - node.last_heartbeat_ts < timeout:
+                continue
 
-        node.become_candidate()
-        save_metadata(node, node_data_dir)
+            node.become_candidate()
+            save_metadata(node, node_data_dir)
 
-        current_term = node.current_term
-        last_index, last_term = node.get_last_log_index_term()
-
-        votes_granted_by = {node.node_id}
+            current_term = node.current_term
+            last_index, last_term = node.get_last_log_index_term()
+            votes_granted_by = {node.node_id}  # голос за себя
 
         logger.info(
             "[%s] Start election term=%s (cluster=%s)",
@@ -106,8 +105,9 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
             targets.append((peer_id, base_url))
 
         if not targets:
-            if node.role == RaftRole.CANDIDATE and node.current_term == current_term:
-                node.become_leader()
+            async with node.lock:
+                if node.role == RaftRole.CANDIDATE and node.current_term == current_term:
+                    node.become_leader()
             continue
 
         async with httpx.AsyncClient(timeout=1.0) as client:
@@ -129,23 +129,21 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
 
             try:
                 for fut in asyncio.as_completed(tasks):
-                    if node.role != RaftRole.CANDIDATE or node.current_term != current_term:
-                        break
+                    async with node.lock:
+                        if node.role != RaftRole.CANDIDATE or node.current_term != current_term:
+                            break
 
                     try:
                         peer_id, resp_term, vote_granted = await fut
                     except Exception as exc:
-                        logger.warning(
-                            "[%s] RequestVote task failed: %r",
-                            node.node_id,
-                            exc,
-                        )
+                        logger.warning("[%s] RequestVote task failed: %r", node.node_id, exc)
                         continue
 
-                    if resp_term > node.current_term:
-                        node.become_follower(resp_term)
-                        save_metadata(node, node_data_dir)
-                        break
+                    async with node.lock:
+                        if resp_term > node.current_term:
+                            node.become_follower(resp_term)
+                            save_metadata(node, node_data_dir)
+                            break
 
                     if vote_granted:
                         votes_granted_by.add(peer_id)
@@ -155,8 +153,11 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
                             peer_id,
                             sorted(list(votes_granted_by)),
                         )
+
                         if len(votes_granted_by) >= node.majority():
-                            node.become_leader()
+                            async with node.lock:
+                                if node.role == RaftRole.CANDIDATE and node.current_term == current_term:
+                                    node.become_leader()
                             break
             finally:
                 for t in tasks:
@@ -165,36 +166,35 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 
-        if (
-            node.role == RaftRole.CANDIDATE
-            and node.current_term == current_term
-            and len(votes_granted_by) >= node.majority()
-        ):
-            node.become_leader()
+        async with node.lock:
+            if (
+                node.role == RaftRole.CANDIDATE
+                and node.current_term == current_term
+                and len(votes_granted_by) >= node.majority()
+            ):
+                node.become_leader()
 
 
 async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
-    """Цикл heartbeat'ов лидера."""
-
+    """Цикл heartbeat'ов/репликации лидера:"""
     peer_addresses: Dict[str, str] = app.state.peer_addresses
     node_data_dir: str = app.state.data_dir
 
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
-        if node.role != RaftRole.LEADER:
-            continue
-
-        cluster_size = 1 + len(peer_addresses)
+        async with node.lock:
+            if node.role != RaftRole.LEADER:
+                continue
+            leader_commit = node.commit_index
+            cluster_size = 1 + len(peer_addresses)
 
         async with httpx.AsyncClient(timeout=1.0) as client:
-            leader_commit = node.commit_index
-
             for peer_id, base_url in peer_addresses.items():
                 if peer_id == node.node_id:
                     continue
 
-                ok = await replicate_to_peer(
+                await replicate_to_peer(
                     client=client,
                     node=node,
                     peer_id=peer_id,
@@ -202,29 +202,18 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
                     leader_commit=leader_commit,
                 )
 
-                if node.role != RaftRole.LEADER:
-                    save_metadata(node, node_data_dir)
-                    break
+                async with node.lock:
+                    if node.role != RaftRole.LEADER:
+                        save_metadata(node, node_data_dir)
+                        break
 
-                logger.debug(
-                    "[%s] heartbeat/replicate peer=%s ok=%s nextIndex=%s matchIndex=%s",
-                    node.node_id,
-                    peer_id,
-                    ok,
-                    node.next_index.get(peer_id),
-                    node.match_index.get(peer_id),
-                )
-
+        async with node.lock:
             if node.role != RaftRole.LEADER:
                 continue
 
             advanced = advance_commit_index(node, cluster_size=cluster_size)
             if advanced is not None:
-                logger.info(
-                    "[%s] leader advanced commit_index -> %s",
-                    node.node_id,
-                    node.commit_index,
-                )
+                logger.info("[%s] leader advanced commit_index -> %s", node.node_id, node.commit_index)
                 node.apply_committed_entries()
                 save_full_state(node, node_data_dir)
 

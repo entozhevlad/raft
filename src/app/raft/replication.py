@@ -19,54 +19,6 @@ def _serialize_entries(node: RaftNode, start_index: int) -> List[Dict]:
     return out
 
 
-async def _send_install_snapshot(
-    *,
-    client: httpx.AsyncClient,
-    node: RaftNode,
-    peer_id: str,
-    base_url: str,
-) -> bool:
-    """Шлём snapshot на peer."""
-    if node.snapshot_state is None:
-        return False
-
-    payload = {
-        "term": node.current_term,
-        "leader_id": node.node_id,
-        "last_included_index": node.log.base_index,
-        "last_included_term": node.log.base_term,
-        "state": node.snapshot_state,
-    }
-
-    try:
-        resp = await client.post(f"{base_url}/raft/install_snapshot", json=payload)
-    except (httpx.HTTPError, OSError) as e:
-        logger.warning(
-            "install_snapshot to %s failed: %r",
-            peer_id,
-            e,
-        )
-        return False
-
-    if resp.status_code != 200:
-        return False
-
-    data = resp.json()
-    resp_term = int(data.get("term", node.current_term))
-    success = bool(data.get("success", False))
-
-    if resp_term > node.current_term:
-        node.become_follower(resp_term)
-        return False
-
-    if success:
-        node.match_index[peer_id] = max(node.match_index.get(peer_id, 0), node.log.base_index)
-        node.next_index[peer_id] = max(node.next_index.get(peer_id, 1), node.log.base_index + 1)
-        return True
-
-    return False
-
-
 async def replicate_to_peer(
     *,
     client: httpx.AsyncClient,
@@ -77,59 +29,90 @@ async def replicate_to_peer(
     max_backtracks: int = 20,
 ) -> bool:
     """Догоняющая репликация к peer через nextIndex/matchIndex."""
-    if node.role != RaftRole.LEADER:
-        return False
-
-    if peer_id not in node.next_index:
-        node.next_index[peer_id] = node.log.last_index() + 1
-    if peer_id not in node.match_index:
-        node.match_index[peer_id] = 0
-
-    term = node.current_term
-
-    for _ in range(max_backtracks):
-        if node.role != RaftRole.LEADER or node.current_term != term:
+    async with node.lock:
+        if node.role != RaftRole.LEADER:
             return False
 
-        next_idx = max(1, node.next_index.get(peer_id, 1))
-        if next_idx <= node.log.base_index:
-            ok = await _send_install_snapshot(
-                client=client,
-                node=node,
-                peer_id=peer_id,
-                base_url=base_url,
-            )
-            if not ok:
-                return False
-            await asyncio.sleep(0)
-            continue
-        prev_idx = next_idx - 1
-        prev_term = node.log.term_at(prev_idx)
-        entries = _serialize_entries(node, next_idx)
+        if peer_id not in node.next_index:
+            node.next_index[peer_id] = node.log.last_index() + 1
+        if peer_id not in node.match_index:
+            node.match_index[peer_id] = 0
 
-        payload = {
-            "term": term,
-            "leader_id": node.node_id,
-            "prev_log_index": prev_idx,
-            "prev_log_term": prev_term,
-            "entries": entries,
-            "leader_commit": leader_commit,
-        }
+        op_term = node.current_term
+
+    for _ in range(max_backtracks):
+        async with node.lock:
+            if node.role != RaftRole.LEADER or node.current_term != op_term:
+                return False
+
+            next_idx = max(1, node.next_index.get(peer_id, 1))
+            need_snapshot = next_idx <= node.log.base_index
+
+            prev_idx: int | None = None
+            entries: List[Dict] = []
+            payload: Dict[str, object] | None = None
+            snap_payload: Dict[str, object] | None = None
+
+            if need_snapshot:
+                if node.snapshot_state is None:
+                    return False
+
+                snap_payload = {
+                    "term": node.current_term,
+                    "leader_id": node.node_id,
+                    "last_included_index": node.log.base_index,
+                    "last_included_term": node.log.base_term,
+                    "state": node.snapshot_state,
+                }
+            else:
+                prev_idx = next_idx - 1
+                prev_term = node.log.term_at(prev_idx)
+                entries = _serialize_entries(node, next_idx)
+
+                payload = {
+                    "term": node.current_term,
+                    "leader_id": node.node_id,
+                    "prev_log_index": prev_idx,
+                    "prev_log_term": prev_term,
+                    "entries": entries,
+                    "leader_commit": leader_commit,
+                }
 
         try:
-            resp = await client.post(f"{base_url}/raft/append_entries", json=payload)
+            if need_snapshot:
+                resp = await client.post(f"{base_url}/raft/install_snapshot", json=snap_payload)
+            else:
+                resp = await client.post(f"{base_url}/raft/append_entries", json=payload)
+
             if resp.status_code != 200:
                 return False
 
             data = resp.json()
-            resp_term = int(data.get("term", term))
+        except Exception as exc:
+            logger.warning("[%s] replicate_to_peer(%s) failed: %r", node.node_id, peer_id, exc)
+            return False
+
+        async with node.lock:
+            if node.role != RaftRole.LEADER or node.current_term != op_term:
+                return False
+
+            resp_term = int(data.get("term", op_term))
             success = bool(data.get("success", False))
 
             if resp_term > node.current_term:
                 node.become_follower(resp_term)
                 return False
 
+            if need_snapshot:
+                if success:
+                    node.match_index[peer_id] = max(node.match_index.get(peer_id, 0), node.log.base_index)
+                    node.next_index[peer_id] = max(node.next_index.get(peer_id, 1), node.log.base_index + 1)
+                    return True
+                return False
+
             if success:
+                if prev_idx is None:
+                    return False
                 if entries:
                     match = prev_idx + len(entries)
                     node.match_index[peer_id] = max(node.match_index.get(peer_id, 0), match)
@@ -139,13 +122,9 @@ async def replicate_to_peer(
                     node.next_index[peer_id] = max(node.next_index.get(peer_id, 1), prev_idx + 1)
                 return True
 
-
             node.next_index[peer_id] = max(1, next_idx - 1)
-            await asyncio.sleep(0)
 
-        except Exception as exc:
-            logger.warning("[%s] replicate_to_peer(%s) failed: %r", node.node_id, peer_id, exc)
-            return False
+        await asyncio.sleep(0)
 
     return False
 

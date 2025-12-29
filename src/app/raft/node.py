@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.app.raft.log import LogEntry, RaftLog
 from src.app.raft.state_machine import KeyValueStateMachine
+import asyncio
+
 
 logger = logging.getLogger("raft")
 
@@ -46,6 +48,8 @@ class RaftNode:
     match_index: Dict[str, int] = field(default_factory=dict)
 
     last_heartbeat_ts: float = field(default_factory=time.monotonic)
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
 
     def get_cluster_nodes(self) -> List[str]:
         """Получить статический список узлов: self + peers из конфига."""
