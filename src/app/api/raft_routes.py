@@ -19,6 +19,7 @@ def get_raft_node(request: Request) -> RaftNode:
 
 @router.post("/request_vote")
 async def request_vote(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+
     node = get_raft_node(request)
 
     try:
@@ -43,7 +44,6 @@ async def request_vote(request: Request, body: Dict[str, Any]) -> Dict[str, Any]
             candidate_last_log_term=last_log_term,
         )
 
-        # metadata могла измениться (current_term, voted_for) — сохраним
         node_data_dir: str = request.app.state.data_dir
         save_full_state(node, node_data_dir)
 
@@ -60,6 +60,7 @@ async def request_vote(request: Request, body: Dict[str, Any]) -> Dict[str, Any]
 
 @router.post("/append_entries")
 async def append_entries(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+
     node = get_raft_node(request)
 
     try:
@@ -89,7 +90,6 @@ async def append_entries(request: Request, body: Dict[str, Any]) -> Dict[str, An
 
         node.apply_committed_entries()
 
-        # Журнал и KV могли измениться — сохраняем
         node_data_dir: str = request.app.state.data_dir
         save_full_state(node, node_data_dir)
 

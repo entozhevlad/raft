@@ -46,7 +46,6 @@ async def _replicate_command(
     entry = LogEntry(term=node.current_term, index=new_index, command=command)
     node.log.append([entry])
 
-    # save_metadata(node, node_data_dir)
     save_full_state(node, node_data_dir)
 
     deadline = time.monotonic() + commit_timeout_s
