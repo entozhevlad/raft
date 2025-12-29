@@ -1,13 +1,3 @@
-# src/app/config.py
-#
-# Конфигурация узла.
-# Читает NODE_ID, PEERS и DATA_DIR из переменных окружения.
-#
-# Примеры:
-#   NODE_ID=node1
-#   PEERS=node2:http://node2:8000,node3:http://node3:8000
-#   DATA_DIR=/data   (для Docker) или ./data (по умолчанию)
-
 from __future__ import annotations
 
 import os

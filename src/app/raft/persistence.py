@@ -1,13 +1,3 @@
-# src/app/raft/persistence.py
-#
-# Простейшая персистентность состояния RAFT-узла:
-#   - metadata.json: current_term, voted_for
-#   - log.json: журнал RAFT
-#   - kv.json: состояние key-value
-#
-# Каталог хранится как: <base_data_dir>/<node_id>/
-# Например: ./data/node1/metadata.json
-
 from __future__ import annotations
 
 import json
@@ -24,10 +14,7 @@ SNAPSHOT_FILE = "snapshot.json"
 
 
 def ensure_node_data_dir(base_dir: str, node_id: str) -> str:
-    """
-    Создаёт (если нужно) каталог для конкретного узла.
-    Возвращает путь к нему.
-    """
+    """Проверка и создание каталога для узла."""
     node_dir = os.path.join(base_dir, node_id)
     os.makedirs(node_dir, exist_ok=True)
     return node_dir
@@ -44,29 +31,18 @@ def _read_json(path: str) -> Any:
 
 
 def _write_json(path: str, data: Any) -> None:
-    # гарантируем, что директория существует
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
 
     tmp_path = f"{path}.tmp"
-    # tmp лежит в той же директории — она уже создана выше
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, path)
 
 
-# ==== ЗАГРУЗКА ====
-
 def load_node_state(node: RaftNode, node_dir: str) -> None:
-    """
-    Загружает состояние узла из файлов, если они есть:
-      - snapshot.json (если есть): base_index/base_term + snapshot_state + state machine
-      - metadata.json
-      - log.json (только хвост после base_index)
-      - kv.json (если есть — считается "истиной", совместимо с прошлым форматом)
-    """
-    # 0) snapshot (важно грузить первым, чтобы log.from_serializable получил base_index/base_term)
+    """Загружает состояние узла из файлов, если они есть."""
     snap_path = os.path.join(node_dir, SNAPSHOT_FILE)
     snap = _read_json(snap_path)
     base_index = 0
@@ -79,7 +55,6 @@ def load_node_state(node: RaftNode, node_dir: str) -> None:
             node.snapshot_state = dict(snap_state)
             node.state_machine.load_state(snap_state)
 
-    # 1) metadata
     meta_path = os.path.join(node_dir, METADATA_FILE)
     meta = _read_json(meta_path) or {}
 
@@ -87,34 +62,27 @@ def load_node_state(node: RaftNode, node_dir: str) -> None:
     node.voted_for = meta.get("voted_for", None)
     node.commit_index = int(meta.get("commit_index", 0) or 0)
 
-    # Вариант A: last_applied НЕ доверяем/не грузим с диска.
-    # После рестарта будем догонять state machine применением лога.
     node.last_applied = base_index
 
     peer_addrs = meta.get("peer_addresses")
     if isinstance(peer_addrs, dict):
-        # merge into existing (init from env/config)
         for k, v in peer_addrs.items():
             if k and k != node.node_id and isinstance(v, str) and v:
                 node.peer_addresses[str(k)] = v
 
-    # 2) log
     log_path = os.path.join(node_dir, LOG_FILE)
     log_data = _read_json(log_path)
     if isinstance(log_data, list):
         node.log = RaftLog.from_serializable(log_data, base_index=base_index, base_term=base_term)
     else:
-        # даже если лог пуст — base_index/base_term должны сохраниться
         node.log.base_index = base_index
         node.log.base_term = base_term
 
-    # 3) kv (совместимость: если kv.json есть, он перезатирает snapshot state)
     kv_path = os.path.join(node_dir, KV_FILE)
     kv_data = _read_json(kv_path)
     if isinstance(kv_data, dict):
         node.state_machine.load_state(kv_data)
 
-    # Санитизация индексов относительно лога/снапшота
     if node.commit_index < node.log.base_index:
         node.commit_index = node.log.base_index
     if node.last_applied < node.log.base_index:
@@ -125,18 +93,13 @@ def load_node_state(node: RaftNode, node_dir: str) -> None:
     if node.last_applied > node.commit_index:
         node.last_applied = node.commit_index
 
-
-# ==== СОХРАНЕНИЕ ====
-
 def save_metadata(node: RaftNode, node_dir: str) -> None:
     meta_path = os.path.join(node_dir, METADATA_FILE)
 
     data: Dict[str, Any] = {
         "current_term": node.current_term,
         "voted_for": node.voted_for,
-        # (2) Persist volatile индексы, чтобы пережить рестарт без повторного apply.
         "commit_index": node.commit_index,
-        # Статическая конфигурация (для совместимости рестартов)
         "members": sorted([node.node_id] + list(node.peers)),
         "peer_addresses": dict(getattr(node, "peer_addresses", {}) or {}),
     }
@@ -158,7 +121,7 @@ def save_kv_state(node: RaftNode, node_dir: str) -> None:
 
 def save_full_state(node: RaftNode, node_dir: str) -> None:
     """
-    Сохраняет metadata + (возможно snapshot+compaction) + log + kv.
+    Сохраняет metadata +  + log + kv.
     """
     # 1) возможно создаём snapshot и компактим лог
     try:
@@ -170,12 +133,10 @@ def save_full_state(node: RaftNode, node_dir: str) -> None:
     if created:
         save_snapshot(node, node_dir)
 
-    # 2) обычная персистентность
     save_metadata(node, node_dir)
     save_log(node, node_dir)
     save_kv_state(node, node_dir)
 
-    # 3) если snapshot уже есть (base_index > 0), поддерживаем snapshot.json актуальным
     if node.log.base_index > 0:
         save_snapshot(node, node_dir)
 

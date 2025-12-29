@@ -1,9 +1,3 @@
-# app/raft/timers.py
-#
-# Фоновые задачи RAFT:
-#   - цикл выборов (election loop)
-#   - цикл heartbeat лидера (heartbeat loop)
-
 from __future__ import annotations
 
 import asyncio
@@ -22,13 +16,13 @@ from src.app.raft.replication import advance_commit_index, replicate_to_peer
 
 logger = logging.getLogger("raft")
 
-# Тайминги можно потом подстроить
-ELECTION_TIMEOUT_RANGE = (1.5, 3.0)  # секунды
-HEARTBEAT_INTERVAL = 0.5             # секунды
+
+ELECTION_TIMEOUT_RANGE = (1.5, 3.0)
+HEARTBEAT_INTERVAL = 0.5
 
 
 def start_background_tasks(app: FastAPI, node: RaftNode) -> list[asyncio.Task]:
-    """Создаёт и возвращает фоновые задачи RAFT с понятными именами."""
+    """Запуск election_loop и heartbead_loop в фоне."""
     logger.info("[%s] start election timer/heartbeat tasks", node.node_id)
     tasks = [
         asyncio.create_task(election_loop(app, node), name=f"election_loop-{node.node_id}"),
@@ -38,7 +32,7 @@ def start_background_tasks(app: FastAPI, node: RaftNode) -> list[asyncio.Task]:
 
 
 async def stop_background_tasks(tasks: list[asyncio.Task]) -> None:
-    """Останавливает ранее запущенные фоновые задачи."""
+    """Останавливает фоновые задачи."""
     for t in tasks:
         t.cancel()
     if tasks:
@@ -55,11 +49,8 @@ async def _request_vote_rpc(
     last_index: int,
     last_term: int,
 ) -> tuple[str, int, bool]:
-    """
-    Один RequestVote RPC.
-    Возвращает (peer_id, resp_term, vote_granted).
-    Исключения пробрасываем наверх (их обработает caller).
-    """
+    """Запросить голос у ноды."""
+
     req = RequestVoteRequest(
         term=current_term,
         candidate_id=node.node_id,
@@ -78,14 +69,9 @@ async def _request_vote_rpc(
 
 
 async def election_loop(app: FastAPI, node: RaftNode) -> None:
-    """
-    Цикл выборов:
-      - ждём случайный таймаут
-      - если за это время не было heartbeat и мы не лидер — начинаем выборы
-      - RequestVote шлём параллельно
-    """
-    peer_addresses: Dict[str, str] = app.state.peer_addresses  # type: ignore[assignment]
-    node_data_dir: str = app.state.data_dir  # type: ignore[assignment]
+    """Функция цикла выборов."""
+    peer_addresses: Dict[str, str] = app.state.peer_addresses
+    node_data_dir: str = app.state.data_dir
 
     while True:
         timeout = random.uniform(*ELECTION_TIMEOUT_RANGE)
@@ -98,23 +84,21 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
         if now - node.last_heartbeat_ts < timeout:
             continue
 
-        # Старт выборов
         node.become_candidate()
         save_metadata(node, node_data_dir)
 
         current_term = node.current_term
-        last_index, last_term = node.last_log_index_term()
+        last_index, last_term = node.get_last_log_index_term()
 
-        votes_granted_by = {node.node_id}  # голос за себя
+        votes_granted_by = {node.node_id}
 
         logger.info(
             "[%s] Start election term=%s (cluster=%s)",
             node.node_id,
             current_term,
-            sorted(list(node.cluster_nodes())),
+            sorted(list(node.get_cluster_nodes())),
         )
 
-        # Кому вообще шлём RequestVote
         targets: list[tuple[str, str]] = []
         for peer_id, base_url in peer_addresses.items():
             if peer_id == node.node_id:
@@ -122,7 +106,6 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
             targets.append((peer_id, base_url))
 
         if not targets:
-            # одиночный узел
             if node.role == RaftRole.CANDIDATE and node.current_term == current_term:
                 node.become_leader()
             continue
@@ -146,7 +129,6 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
 
             try:
                 for fut in asyncio.as_completed(tasks):
-                    # Если мы уже не кандидат/term сменился — прекращаем обработку
                     if node.role != RaftRole.CANDIDATE or node.current_term != current_term:
                         break
 
@@ -177,14 +159,12 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
                             node.become_leader()
                             break
             finally:
-                # отменяем оставшиеся RPC, если они ещё живы
                 for t in tasks:
                     if not t.done():
                         t.cancel()
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 
-        # На всякий случай (если кворум набран, но не успели перейти в лидера внутри цикла)
         if (
             node.role == RaftRole.CANDIDATE
             and node.current_term == current_term
@@ -194,18 +174,10 @@ async def election_loop(app: FastAPI, node: RaftNode) -> None:
 
 
 async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
-    """
-    Цикл heartbeat'ов/репликации лидера:
-      - если мы лидер, периодически:
-          1) догоняюще реплицируем лог на всех peers (это же и heartbeat)
-          2) пытаемся продвинуть commitIndex
-          3) применяем закоммиченное к state machine
+    """Цикл heartbeat'ов лидера."""
 
-    Важно: тут heartbeat НЕ шлётся "всем одинаковый prev_log_index".
-    Вместо этого используем nextIndex/matchIndex для каждого peer.
-    """
-    peer_addresses: Dict[str, str] = app.state.peer_addresses  # type: ignore[assignment]
-    node_data_dir: str = app.state.data_dir  # type: ignore[assignment]
+    peer_addresses: Dict[str, str] = app.state.peer_addresses
+    node_data_dir: str = app.state.data_dir
 
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -218,7 +190,6 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
         async with httpx.AsyncClient(timeout=1.0) as client:
             leader_commit = node.commit_index
 
-            # 1) Репликация/heartbeat на peers (только voting members текущей конфигурации)
             for peer_id, base_url in peer_addresses.items():
                 if peer_id == node.node_id:
                     continue
@@ -231,7 +202,6 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
                     leader_commit=leader_commit,
                 )
 
-                # replicate_to_peer мог перевести нас в follower, если увидел более новый term
                 if node.role != RaftRole.LEADER:
                     save_metadata(node, node_data_dir)
                     break
@@ -248,7 +218,6 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
             if node.role != RaftRole.LEADER:
                 continue
 
-            # 2) Пробуем продвинуть commitIndex (advance_commit_index теперь должен учитывать joint consensus)
             advanced = advance_commit_index(node, cluster_size=cluster_size)
             if advanced is not None:
                 logger.info(
@@ -259,5 +228,4 @@ async def heartbeat_loop(app: FastAPI, node: RaftNode) -> None:
                 node.apply_committed_entries()
                 save_full_state(node, node_data_dir)
 
-            # 3) Сохраняем metadata (для учебного проекта нормально)
             save_metadata(node, node_data_dir)

@@ -16,7 +16,7 @@ def setup_runtime(app: FastAPI) -> None:
 
     @app.on_event("startup")
     async def _start() -> None:
-        node: RaftNode = app.state.raft_node  # type: ignore[assignment]
+        node: RaftNode = app.state.raft_node
         logger.info("[%s] start RAFT runtime", node.node_id)
         app.state._raft_tasks = start_background_tasks(app, node)
 

@@ -12,7 +12,7 @@ logger = logging.getLogger("raft")
 
 
 def _serialize_entries(node: RaftNode, start_index: int) -> List[Dict]:
-    """Сериализует log entries начиная с start_index в payload для AppendEntries."""
+    """Сериализует log entries для AppendEntries."""
     out: List[Dict] = []
     for e in node.log.entries_from(start_index):
         out.append({"term": e.term, "command": e.command})
@@ -26,9 +26,7 @@ async def _send_install_snapshot(
     peer_id: str,
     base_url: str,
 ) -> bool:
-    """
-    Шлём snapshot на peer. Snapshot должен соответствовать node.log.base_index.
-    """
+    """Шлём snapshot на peer."""
     if node.snapshot_state is None:
         return False
 
@@ -78,9 +76,7 @@ async def replicate_to_peer(
     leader_commit: int,
     max_backtracks: int = 20,
 ) -> bool:
-    """
-    Догоняющая репликация к peer через nextIndex/matchIndex.
-    """
+    """Догоняющая репликация к peer через nextIndex/matchIndex."""
     if node.role != RaftRole.LEADER:
         return False
 
@@ -105,7 +101,6 @@ async def replicate_to_peer(
             )
             if not ok:
                 return False
-            # после snapshot повторим цикл (теперь next_index должен быть base_index+1)
             await asyncio.sleep(0)
             continue
         prev_idx = next_idx - 1
@@ -144,7 +139,7 @@ async def replicate_to_peer(
                     node.next_index[peer_id] = max(node.next_index.get(peer_id, 1), prev_idx + 1)
                 return True
 
-            # success=false -> откатываем nextIndex и пробуем ещё
+
             node.next_index[peer_id] = max(1, next_idx - 1)
             await asyncio.sleep(0)
 
@@ -156,17 +151,12 @@ async def replicate_to_peer(
 
 
 def advance_commit_index(node: RaftNode, *, cluster_size: int | None = None) -> Optional[int]:
-    """Продвигает commit_index по правилу RAFT.
-
-    Коммитим N, если:
-      1) term(N) == currentTerm
-      2) N реплицирован минимум на majority статического кластера.
-    """
+    """Продвигает commit_index по правилу RAFT."""
     if node.role != RaftRole.LEADER:
         return None
 
     last = node.log.last_index()
-    cluster = node.cluster_nodes()
+    cluster = node.get_cluster_nodes()
     majority = node.majority()
 
     for n in range(last, node.commit_index, -1):

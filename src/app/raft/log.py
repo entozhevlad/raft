@@ -1,5 +1,3 @@
-# src/app/raft/log.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -15,14 +13,7 @@ class LogEntry:
 
 @dataclass
 class RaftLog:
-    """
-    Лог RAFT с поддержкой compaction через snapshot.
-
-    base_index/base_term — это "виртуальная" запись на позиции base_index,
-    которая уже в snapshot и в entries НЕ хранится.
-
-    entries хранят записи с индексами (base_index+1 .. last_index).
-    """
+    """Лог-журнал RAFT."""
     entries: List[LogEntry] = field(default_factory=list)
     base_index: int = 0
     base_term: int = 0
@@ -61,20 +52,14 @@ class RaftLog:
         self.entries.extend(new_entries)
 
     def truncate_from(self, index: int) -> None:
-        """
-        Обрезает хвост, удаляя записи с индексом >= index.
-        """
+        """Обрезает хвост, удаляя записи с индексом >= index."""
         if index <= self.base_index + 1:
-            # весь entries-хвост удаляем
             self.entries.clear()
             return
         self.entries = [e for e in self.entries if e.index < index]
 
     def entries_from(self, start_index: int) -> List[LogEntry]:
-        """
-        Возвращает срез лога начиная с start_index (включительно),
-        учитывая base_index (после snapshot).
-        """
+        """Возвращает срез лога."""
         if start_index <= self.base_index + 1:
             start_index = self.base_index + 1
         offset = start_index - self.base_index - 1
@@ -85,19 +70,15 @@ class RaftLog:
         return list(self.entries[offset:])
 
     def compact_upto(self, last_included_index: int, last_included_term: int) -> None:
-        """
-        Делает compaction: переносит все <= last_included_index в snapshot.
-        """
+        """Сжатие лога."""
+
         if last_included_index <= self.base_index:
             return
 
-        # Удаляем entries <= last_included_index
         self.entries = [e for e in self.entries if e.index > last_included_index]
 
         self.base_index = last_included_index
         self.base_term = last_included_term
-
-    # ==== Сериализация ====
 
     def to_serializable(self) -> List[Dict[str, Any]]:
         return [{"term": e.term, "index": e.index, "command": e.command} for e in self.entries]

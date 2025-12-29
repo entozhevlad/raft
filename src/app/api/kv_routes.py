@@ -8,17 +8,17 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from src.app.api import errors
+from app.utils import errors
 from src.app.raft.log import LogEntry
 from src.app.raft.node import RaftNode, RaftRole
-from src.app.raft.persistence import save_full_state, save_metadata
+from src.app.raft.persistence import save_full_state
 from src.app.raft.replication import advance_commit_index, replicate_to_peer
 
 router = APIRouter(tags=["kv"])
 
 
 def get_raft_node(request: Request) -> RaftNode:
-    raft_node: RaftNode = request.app.state.raft_node  # type: ignore[assignment]
+    raft_node: RaftNode = request.app.state.raft_node
     return raft_node
 
 
@@ -32,17 +32,8 @@ async def _replicate_command(
     *,
     commit_timeout_s: float = 3.0,
 ) -> int:
-    """Репликация одной команды через RAFT (только на лидере).
+    """Репликация команды через RAFT."""
 
-    Алгоритм:
-      1) append в локальный лог
-      2) fsync-подобно: сохраняем метаданные/лог на диск до коммита (минимально)
-      3) догоняющая репликация на peers через nextIndex/matchIndex
-      4) двигаем commitIndex по правилу RAFT
-      5) apply + save_full_state() после коммита
-
-    Возвращает индекс записи в журнале.
-    """
     node = get_raft_node(request)
 
     if node.role != RaftRole.LEADER:
@@ -51,20 +42,17 @@ async def _replicate_command(
     peer_addresses: Dict[str, str] = request.app.state.peer_addresses
     node_data_dir: str = request.app.state.data_dir
 
-    # 1) Append локально
     new_index = node.log.last_index() + 1
     entry = LogEntry(term=node.current_term, index=new_index, command=command)
     node.log.append([entry])
 
-    # Важно: term/voted_for и лог должны пережить рестарт (упрощенно — сохраняем целиком).
-    save_metadata(node, node_data_dir)
+    # save_metadata(node, node_data_dir)
     save_full_state(node, node_data_dir)
 
     deadline = time.monotonic() + commit_timeout_s
 
     async with httpx.AsyncClient(timeout=1.0) as client:
         while time.monotonic() < deadline:
-            # Если лидерство потеряно — прекращаем.
             if node.role != RaftRole.LEADER:
                 raise HTTPException(
                     status_code=409,
@@ -78,7 +66,6 @@ async def _replicate_command(
 
             leader_commit = node.commit_index
 
-            # 2) Догоняющая репликация на всех peers.
             for peer_id, base_url in peer_addresses.items():
                 await replicate_to_peer(
                     client=client,
@@ -88,19 +75,16 @@ async def _replicate_command(
                     leader_commit=leader_commit,
                 )
 
-            # 3) Пробуем продвинуть commit_index.
             advanced = advance_commit_index(node)
             if advanced is not None:
                 node.apply_committed_entries()
                 save_full_state(node, node_data_dir)
 
-            # 4) Если наша запись закоммичена — успех.
             if node.commit_index >= new_index:
                 return new_index
 
             await asyncio.sleep(0.05)
 
-    # Таймаут коммита: кворум/сеть/падения
     raise HTTPException(
         status_code=503,
         detail={
@@ -115,6 +99,7 @@ async def _replicate_command(
 
 @router.put("/{key}")
 async def put_value(request: Request, key: str, body: PutRequest) -> Dict[str, Any]:
+    """Добавить данные в БД."""
     node = get_raft_node(request)
 
     if node.role != RaftRole.LEADER:
@@ -169,7 +154,7 @@ async def _confirm_leader_quorum(
             ),
         )
 
-    if len(node.cluster_nodes()) == 1:
+    if len(node.get_cluster_nodes()) == 1:
         return
     majority = node.majority()
     term = node.current_term
@@ -268,7 +253,7 @@ async def _ensure_committed_in_current_term(request: Request, *, timeout_s: floa
     """
     node = get_raft_node(request)
     peer_addresses: Dict[str, str] = request.app.state.peer_addresses  # type: ignore[assignment]
-    if node.role != RaftRole.LEADER or len(node.cluster_nodes()) == 1:
+    if node.role != RaftRole.LEADER or len(node.get_cluster_nodes()) == 1:
         return
 
     if node.commit_index == 0 or node.log.term_at(node.commit_index) != node.current_term:
