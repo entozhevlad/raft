@@ -1,0 +1,11 @@
+# IDE
+.idea/
+
+# runtime data
+data/
+
+# Python
+__pycache__/
+*.pyc
+.env
+.venv/
