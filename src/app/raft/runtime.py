@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import List
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, List
 
 from fastapi import FastAPI
 
@@ -11,19 +12,21 @@ from src.app.raft.timers import start_background_tasks, stop_background_tasks
 logger = logging.getLogger("raft")
 
 
-def setup_runtime(app: FastAPI) -> None:
-    """Регистрация старта/остановки фоновых задач RAFT."""
+@asynccontextmanager
+async def raft_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    node: RaftNode = app.state.raft_node
+    logger.info("[%s] start RAFT runtime", node.node_id)
 
-    @app.on_event("startup")
-    async def _start() -> None:
-        node: RaftNode = app.state.raft_node
-        logger.info("[%s] start RAFT runtime", node.node_id)
-        app.state._raft_tasks = start_background_tasks(app, node)
-
-    @app.on_event("shutdown")
-    async def _stop() -> None:
-        tasks: List = getattr(app.state, "_raft_tasks", [])
+    tasks = start_background_tasks(app, node)
+    app.state._raft_tasks = tasks
+    try:
+        yield
+    finally:
         if tasks:
-            logger.info("Stopping RAFT runtime tasks")
+            logger.info("[%s] stopping RAFT runtime tasks", node.node_id)
             await stop_background_tasks(tasks)
 
+
+def setup_runtime(app: FastAPI) -> None:
+    """Регистрация lifespan-хендлера для RAFT."""
+    app.router.lifespan_context = raft_lifespan

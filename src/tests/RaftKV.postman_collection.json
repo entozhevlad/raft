@@ -1,0 +1,418 @@
+{
+  "info": {
+    "_postman_id": "b9c3f3b7-8f85-4e90-9a0e-2e3b6f2f9c10",
+    "name": "Raft KV (RAFT) – API Tests",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "API-tests for RAFT-based KV storage. Assumes 3 nodes on localhost ports 8000/8001/8002."
+  },
+  "item": [
+    {
+      "name": "0. Health",
+      "item": [
+        {
+          "name": "Health node1 (8000)",
+          "request": {
+            "method": "GET",
+            "url": "{{node1}}/health"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('body.status == ok', () => {",
+                  "  const j = pm.response.json();",
+                  "  pm.expect(j.status).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Health node2 (8001)",
+          "request": {
+            "method": "GET",
+            "url": "{{node2}}/health"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('body.status == ok', () => {",
+                  "  const j = pm.response.json();",
+                  "  pm.expect(j.status).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Health node3 (8002)",
+          "request": {
+            "method": "GET",
+            "url": "{{node3}}/health"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('body.status == ok', () => {",
+                  "  const j = pm.response.json();",
+                  "  pm.expect(j.status).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1. RAFT Status",
+      "item": [
+        {
+          "name": "Status node1 (8000)",
+          "request": {
+            "method": "GET",
+            "url": "{{node1}}/raft/status"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('has raft fields', () => {",
+                  "  const j = pm.response.json();",
+                  "  ['node_id','role','term','leader_id','commit_index','last_applied','last_log_index','last_log_term'].forEach(k => pm.expect(j).to.have.property(k));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Status node2 (8001)",
+          "request": {
+            "method": "GET",
+            "url": "{{node2}}/raft/status"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('has raft fields', () => {",
+                  "  const j = pm.response.json();",
+                  "  ['node_id','role','term','leader_id','commit_index','last_applied','last_log_index','last_log_term'].forEach(k => pm.expect(j).to.have.property(k));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Status node3 (8002)",
+          "request": {
+            "method": "GET",
+            "url": "{{node3}}/raft/status"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('has raft fields', () => {",
+                  "  const j = pm.response.json();",
+                  "  ['node_id','role','term','leader_id','commit_index','last_applied','last_log_index','last_log_term'].forEach(k => pm.expect(j).to.have.property(k));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Detect leader (set env leader_base)",
+          "request": {
+            "method": "GET",
+            "url": "{{node1}}/raft/status"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "// This request is used only to run the script; it will also query node2/node3 via pm.sendRequest.",
+                  "function setLeaderFromStatus(base, statusJson) {",
+                  "  if (statusJson && statusJson.role === 'LEADER') {",
+                  "    pm.environment.set('leader_base', base);",
+                  "    pm.environment.set('leader_id', statusJson.node_id);",
+                  "    pm.environment.set('leader_term', String(statusJson.term));",
+                  "    return true;",
+                  "  }",
+                  "  return false;",
+                  "}",
+                  "",
+                  "pm.test('detect leader across nodes', (done) => {",
+                  "  const bases = [pm.environment.get('node1'), pm.environment.get('node2'), pm.environment.get('node3')];",
+                  "  let decided = false;",
+                  "  let pending = bases.length;",
+                  "",
+                  "  bases.forEach((b) => {",
+                  "    pm.sendRequest({ url: b + '/raft/status', method: 'GET' }, (err, res) => {",
+                  "      pending--;",
+                  "      if (!err && res && res.code === 200) {",
+                  "        try {",
+                  "          const j = res.json();",
+                  "          if (!decided && setLeaderFromStatus(b, j)) {",
+                  "            decided = true;",
+                  "          }",
+                  "        } catch (e) {}",
+                  "      }",
+                  "      if (pending === 0) {",
+                  "        pm.expect(pm.environment.get('leader_base')).to.be.ok;",
+                  "        done();",
+                  "      }",
+                  "    });",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. KV Basic (leader only)",
+      "item": [
+        {
+          "name": "PUT key a = 123 (leader)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"value\": 123}"
+            },
+            "url": "{{leader_base}}/kv/a"
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "pm.test('leader_base set', () => { pm.expect(pm.environment.get('leader_base')).to.be.ok; });"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('put ok', () => {",
+                  "  const j = pm.response.json();",
+                  "  pm.expect(j.status).to.eql('ok');",
+                  "  pm.expect(j.op).to.eql('put');",
+                  "  pm.expect(j.key).to.eql('a');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET key a (leader)",
+          "request": {
+            "method": "GET",
+            "url": "{{leader_base}}/kv/a"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('value == 123', () => {",
+                  "  const j = pm.response.json();",
+                  "  pm.expect(j.key).to.eql('a');",
+                  "  pm.expect(j.value).to.eql(123);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "DELETE key a (leader)",
+          "request": {
+            "method": "DELETE",
+            "url": "{{leader_base}}/kv/a"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('delete ok', () => {",
+                  "  const j = pm.response.json();",
+                  "  pm.expect(j.status).to.eql('ok');",
+                  "  pm.expect(j.op).to.eql('delete');",
+                  "  pm.expect(j.key).to.eql('a');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET deleted key a (leader) => 404",
+          "request": {
+            "method": "GET",
+            "url": "{{leader_base}}/kv/a"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 404', () => pm.response.to.have.status(404));",
+                  "pm.test('key_not_found', () => {",
+                  "  const j = pm.response.json();",
+                  "  pm.expect(j.detail.error).to.eql('key_not_found');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. KV on follower (must reject)",
+      "item": [
+        {
+          "name": "PUT on node1 (may be follower) -> allow 200 or 409; if 409 must be not_leader",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"value\": 1}"
+            },
+            "url": "{{node1}}/kv/follower_test"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 200 or 409', () => {",
+                  "  pm.expect([200,409]).to.include(pm.response.code);",
+                  "});",
+                  "if (pm.response.code === 409) {",
+                  "  pm.test('not_leader error', () => {",
+                  "    const j = pm.response.json();",
+                  "    pm.expect(j.detail.error).to.eql('not_leader');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PUT on node2 (may be follower) -> allow 200 or 409; if 409 must be not_leader",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"value\": 1}"
+            },
+            "url": "{{node2}}/kv/follower_test"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 200 or 409', () => {",
+                  "  pm.expect([200,409]).to.include(pm.response.code);",
+                  "});",
+                  "if (pm.response.code === 409) {",
+                  "  pm.test('not_leader error', () => {",
+                  "    const j = pm.response.json();",
+                  "    pm.expect(j.detail.error).to.eql('not_leader');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PUT on node3 (may be follower) -> allow 200 or 409; if 409 must be not_leader",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"value\": 1}"
+            },
+            "url": "{{node3}}/kv/follower_test"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status is 200 or 409', () => {",
+                  "  pm.expect([200,409]).to.include(pm.response.code);",
+                  "});",
+                  "if (pm.response.code === 409) {",
+                  "  pm.test('not_leader error', () => {",
+                  "    const j = pm.response.json();",
+                  "    pm.expect(j.detail.error).to.eql('not_leader');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

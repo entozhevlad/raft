@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -8,8 +9,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.app.raft.log import LogEntry, RaftLog
 from src.app.raft.state_machine import KeyValueStateMachine
-import asyncio
-
 
 logger = logging.getLogger("raft")
 
@@ -59,7 +58,7 @@ class RaftNode:
         return len(self.get_cluster_nodes()) // 2 + 1
 
     def get_last_log_index_term(self) -> Tuple[int, int]:
-        """Возвращает lastLogIndex и lastLogTerm)."""
+        """Возвращает lastLogIndex и lastLogTerm."""
         return self.log.last_index(), self.log.last_term()
 
     def to_status_dict(self) -> Dict[str, Any]:
@@ -336,8 +335,6 @@ class RaftNode:
             )
 
             self.state_machine.apply(entry.command)
-
-
 
     def maybe_create_snapshot(self, *, threshold: int) -> bool:
         """Проверка доступности сохранения снапшота."""

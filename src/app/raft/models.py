@@ -37,3 +37,6 @@ class AppendEntriesResponse(BaseModel):
 
     term: int
     success: bool
+
+class PutRequest(BaseModel):
+    value: Any

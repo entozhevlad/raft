@@ -5,17 +5,11 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Request
 
-from src.app.raft.node import RaftNode
+from src.app.utils.deps import get_raft_node
 from src.app.raft.persistence import save_full_state
 
 router = APIRouter(tags=["raft"])
 logger = logging.getLogger("raft")
-
-
-def get_raft_node(request: Request) -> RaftNode:
-    raft_node: RaftNode = request.app.state.raft_node
-    return raft_node
-
 
 @router.post("/request_vote")
 async def request_vote(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
